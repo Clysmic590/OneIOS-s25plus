@@ -1,0 +1,100 @@
+name: Build OneiOS S25+ APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout this patch repository
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Checkout companion app at the patch's base revision
+        uses: actions/checkout@v4
+        with:
+          repository: akshaynexus/OneOS
+          ref: bdf3db05e0aaacf996d1ec2a1bd3f0019b0a7f82
+          path: source
+
+      - name: Apply S25+ app patch
+        working-directory: source
+        run: |
+          git apply --check ../patch/patches/s25-plus-app.patch
+          git apply ../patch/patches/s25-plus-app.patch
+
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Android SDK platform 37
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-37.0" "build-tools;37.0.0"
+
+      - name: Configure GitHub Packages access
+        working-directory: source
+        env:
+          RUN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECRET_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SECRET_USER: ${{ secrets.GH_PACKAGES_USER }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          pom='https://maven.pkg.github.com/tribalfs/*/io/github/tribalfs/oneui-design/0.9.13+oneui8/oneui-design-0.9.13+oneui8.pom'
+          user="${SECRET_USER:-$GITHUB_ACTOR}"
+          token="${SECRET_TOKEN:-$RUN_TOKEN}"
+          code=$(curl -sS -g -L -o /tmp/package-pom -w '%{http_code}' -u "$user:$token" "$pom" || echo 000)
+          if [ "$code" != 200 ]; then
+            echo "::error::GitHub Packages returned HTTP $code. If the GITHUB_TOKEN cannot read tribalfs packages, add GH_PACKAGES_TOKEN (read:packages) and optionally GH_PACKAGES_USER in this repository's Actions secrets."
+            head -c 2000 /tmp/package-pom || true
+            exit 1
+          fi
+          echo "GH_PACKAGES_USER=$user" >> "$GITHUB_ENV"
+          echo "GH_PACKAGES_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Build guest manager required by the APK
+        working-directory: source
+        run: scripts/build-guest-manager.sh --debug
+
+      - name: Verify S25+ profile and gate
+        working-directory: source/app-android
+        run: ./gradlew --no-daemon :core:model:test --tests com.fahadali.oneos.core.model.OneiosTest
+
+      - name: Build debug APK
+        working-directory: source/app-android
+        run: ./gradlew --no-daemon :app:assembleFullDebug
+
+      - name: Prepare APK and checksum
+        working-directory: source
+        run: |
+          apk=app-android/app/build/outputs/apk/full/debug/app-full-debug.apk
+          test -s "$apk"
+          cp "$apk" OneiOS-S25Plus-debug.apk
+          sha256sum OneiOS-S25Plus-debug.apk > OneiOS-S25Plus-debug.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OneiOS-S25Plus-debug
+          path: |
+            source/OneiOS-S25Plus-debug.apk
+            source/OneiOS-S25Plus-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
