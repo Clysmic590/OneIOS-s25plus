@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - patches/s25-plus-app.patch
 
 permissions:
   contents: read
