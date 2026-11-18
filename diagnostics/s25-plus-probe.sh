@@ -152,6 +152,11 @@ run thermal sh -c 'for z in /sys/class/thermal/thermal_zone*; do echo "$(cat $z/
 # ---- pack ----
 ARCHIVE=/data/local/tmp/oneios-$TARGET-probe-$STAMP.tar.gz
 tar -czf "$ARCHIVE" -C "$(dirname "$OUT")" "$(basename "$OUT")" 2>/dev/null || ARCHIVE="(tar failed: send the files of $OUT)"
-[ -d /sdcard/Download ] && cp "$ARCHIVE" /sdcard/Download/ 2>/dev/null && echo "copy: /sdcard/Download/$(basename "$ARCHIVE")"
+copied=
+for d in /storage/emulated/0/Download /sdcard/Download; do
+  [ -d "$d" ] || continue
+  if cp "$ARCHIVE" "$d/" 2>/dev/null; then copied="$d/$(basename "$ARCHIVE")"; break; fi
+done
+if [ -n "$copied" ]; then echo "copy: $copied"; else echo "copy failed: archive remains at $ARCHIVE; grant Termux storage access, then copy it from there"; fi
 echo "$TARGET-probe: done: $ARCHIVE ($(ls "$OUT" | wc -l) files in $OUT)"
 
