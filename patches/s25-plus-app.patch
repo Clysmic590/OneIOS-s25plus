@@ -1,0 +1,70 @@
+diff --git a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
+index e6c7e06..48a13db 100644
+--- a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
++++ b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
+@@ -35,8 +35,8 @@ object OneiosSystem {
+     /** The manifest `format` of both a runtime package and an image set this build reads. */
+     const val FORMAT = 1
+ 
+-    /** The phone it is mainly tested and working on: the Galaxy S24 Ultra (SM-S928, e3q, SM8650); other phones are warned, not refused (the owner, 2026-11-16). */
+-    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_ULTRA_8650)
++    /** Phones the app exposes OneiOS for; S24 Ultra is tested, S25+ is an experimental port. */
++    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_ULTRA_8650, Profiles.ID_S_PLUS_8750)
+ 
+     const val R_NOT_THIS_PHONE = "oneios-not-this-phone"
+     const val R_EXPERIMENTAL = "oneios-experimental"
+@@ -57,10 +57,10 @@ object OneiosSystem {
+         offeredOn(Profiles.resolve(model, device, soc, profiles).profile)
+ 
+     /**
+-     * The system-kind gate. On the Galaxy S24 Ultra: a WARN the user has to tick
+-     * ([ACK]) before every switch, as for an untested profile, and OK once [ticked]. On any other
+-     * phone (the owner, 2026-11-16: they may try it): a WARN that says what to expect until
+-     * [notThisPhoneTicked] ([NOT_THIS_PHONE_ACK] on the confirm screen), then OK.
++     * The system-kind gate. On the Galaxy S24 Ultra and S25+, a WARN the user has to tick
++     * ([ACK]) before every switch, then OK once [ticked]. The S25+ is available as an experimental
++     * target, not a tested one. On other phones: a WARN until [notThisPhoneTicked]
++     * ([NOT_THIS_PHONE_ACK] on the confirm screen), then OK.
+      */
+     fun gate(profile: PhoneProfile?, ticked: Boolean, notThisPhoneTicked: Boolean = false): Finding = when {
+         !offeredOn(profile) && !notThisPhoneTicked -> Finding(
+diff --git a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
+index fae14d7..20a7031 100644
+--- a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
++++ b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
+@@ -49,17 +49,22 @@ class OneiosTest {
+     // --- Where it is offered ---------------------------------------------------
+ 
+     @Test
+-    fun onlyTheGalaxyS24UltraIsOffered() {
++    fun theS24UltraAndS25PlusAreOffered() {
+         for (p in Profiles.BUILT_IN) {
+-            assertEquals(p.id, p.id == Profiles.ID_S_ULTRA_8650, OneiosSystem.offeredOn(p))
++            assertEquals(p.id, p.id in setOf(Profiles.ID_S_ULTRA_8650, Profiles.ID_S_PLUS_8750), OneiosSystem.offeredOn(p))
+         }
+         assertFalse(OneiosSystem.offeredOn(null))
+         assertEquals("SM-S928", Profiles.S_ULTRA_8650.modelPrefix)
++        assertEquals("SM-S936", Profiles.S_PLUS_8750.modelPrefix)
+         assertTrue(OneiosSystem.offeredOn("SM-S928B", "e3q", "SM8650"))
+         assertTrue(OneiosSystem.offeredOn("SM-S928U1", "e3q", "SM8650"))
++        assertTrue(OneiosSystem.offeredOn("SM-S936B", "pa2q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S936U1", "pa2q", "SM8750"))
+         // The same model number on another chip or codename is not that phone.
+         assertFalse(OneiosSystem.offeredOn("SM-S928B", "e3s", "s5e9945"))
+         assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
++        assertFalse(OneiosSystem.offeredOn("SM-S936B", "pa2q", "s5e9945"))
++        assertFalse(OneiosSystem.offeredOn("SM-S936B", "wrong-device", "SM8750"))
+         assertFalse(OneiosSystem.offeredOn("SM-S921B", "e1q", "SM8650"))
+         assertFalse(OneiosSystem.offeredOn("SM-F976B", "q8q", "SM8850"))
+     }
+@@ -82,6 +87,10 @@ class OneiosTest {
+         assertEquals(OneiosSystem.R_EXPERIMENTAL, ask.reason)
+         assertTrue(ask.detail.contains("experimental"))
+         assertEquals(Level.OK, OneiosSystem.gate(Profiles.S_ULTRA_8650, ticked = true).level)
++        val s25Plus = OneiosSystem.gate(Profiles.S_PLUS_8750, ticked = false)
++        assertEquals(Level.WARN, s25Plus.level)
++        assertEquals(OneiosSystem.R_EXPERIMENTAL, s25Plus.reason)
++        assertTrue(s25Plus.detail.contains("never been tested"))
+     }
+ 
+     /** It is its own kind of system: no Android image or file set stands for it. */
