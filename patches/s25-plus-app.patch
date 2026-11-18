@@ -83,6 +83,140 @@ index 9d341db..28929ff 100644
      head -c 262144 "$log" | sed 's/^/| /'
      if [ $timed = 1 ]; then
          check_restore "$id"
+diff --git a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosToolJob.kt b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosToolJob.kt
+index 3959e2e..02cd6d2 100644
+--- a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosToolJob.kt
++++ b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosToolJob.kt
+@@ -41,22 +41,12 @@ object OneiosToolJob : BackgroundJob<OneiosToolJob.State>(State(), "oneos-oneios
+ 
+     /** What the app asks the tool for; [mode] is root's `tool` argument (read: allowed during a session). */
+     enum class Flow(val mode: String, val requests: List<Request>, val showAll: Boolean = false) {
+-        /**
+-         * docs/TODO.md "Make iOS image": the IPSW's members from Apple's server by range requests (`fetch` with the
+-         * runtime's own profile; `resume`: a paused, stopped or interrupted fetch goes on from its parts), then the
+-         * tool's `make-image` (the released xnu.macho, the volumes, the tweaks, prelink, the audit and the stub check)
+-         * into `image.new`, which root's `begin image` made and root's `finish image` puts in place with today's checks.
+-         */
++        /** Assemble prepared inputs into image.new. Root publishes the result after the tool verifies it. */
+         MAKE_IMAGE(
+             "work",
+             listOf(
+-                Request(OneiosTool.Cmd.FETCH, mapOf("profile" to "$S/runtime/lib/profiles/ios-27.0.1-iPhone18-2.toml", "indir" to "$S/make/inputs", "resume" to true)),
+                 Request(OneiosTool.Cmd.MAKE_IMAGE, mapOf("indir" to "$S/make/inputs", "out" to "$S/image.new", "sums_list" to "$S/image.new.sha256", "ids_list" to "$S/image.new.ids", "work" to "$S/make")),
+-                // Until the tool has make-image: its `tweaks` answers why the image set cannot be made on the phone
+-                // yet (`not-ported`), and the screen shows that answer beside make-image's. Drop it when make-image comes.
+-                Request(OneiosTool.Cmd.TWEAKS),
+             ),
+-            showAll = true,
+         ),
+ 
+         /** Every file of the staged runtime and image set hashed again against the lists root wrote at staging. */
+@@ -149,7 +139,6 @@ object OneiosToolJob : BackgroundJob<OneiosToolJob.State>(State(), "oneos-oneios
+         try {
+             // This build's root script in the stage first (status installs it, as the checks do).
+             root(app, OneiosRoot.Verb.STATUS, emptyList(), 180_000)?.let { return problem(it) }
+-            if (flow == Flow.MAKE_IMAGE) root(app, OneiosRoot.Verb.BEGIN, listOf("image"), 120_000)?.let { return problem(it) }
+             val s = OneiosToolSession(
+                 OneiosRoot.launcher(OneiosRoot.Verb.TOOL, listOf(flow.mode), BuildConfig.ONEIOS_ROOT_SHA256, BuildConfig.ONEIOS_ROOT_BYTES),
+                 backstop = { root(app, OneiosRoot.Verb.UNTOOL, emptyList(), 60_000) },
+@@ -160,10 +149,18 @@ object OneiosToolJob : BackgroundJob<OneiosToolJob.State>(State(), "oneos-oneios
+                 when (val st = s.start()) {
+                     is OneiosToolSession.Start.Refused -> return problem(st.reason)
+                     is OneiosToolSession.Start.Failed -> return problem(st.reason)
+-                    is OneiosToolSession.Start.Ready -> update(state.copy(
+-                        starting = false, canPause = st.hello.cmds.containsAll(listOf(OneiosTool.Cmd.PAUSE, OneiosTool.Cmd.RESUME)),
+-                        toolVersion = listOfNotNull(st.hello.tool, st.hello.jobs?.let { "$it threads" }).joinToString(" · "),
+-                    ))
++                    is OneiosToolSession.Start.Ready -> {
++                        if (flow == Flow.MAKE_IMAGE) {
++                            if (OneiosTool.Cmd.MAKE_IMAGE !in st.hello.cmds) {
++                                return problem("The installed OneiOS runtime does not support image assembly.")
++                            }
++                            root(app, OneiosRoot.Verb.BEGIN, listOf("image"), 120_000)?.let { return problem(it) }
++                        }
++                        update(state.copy(
++                            starting = false, canPause = st.hello.cmds.containsAll(listOf(OneiosTool.Cmd.PAUSE, OneiosTool.Cmd.RESUME)),
++                            toolVersion = listOfNotNull(st.hello.tool, st.hello.jobs?.let { "$it threads" }).joinToString(" · "),
++                        ))
++                    }
+                 }
+                 if (state.canPause) watch = watchNetwork(app)
+                 for ((i, r) in flow.requests.withIndex()) {
+@@ -186,7 +183,10 @@ object OneiosToolJob : BackgroundJob<OneiosToolJob.State>(State(), "oneos-oneios
+                 session = null
+                 requestId = null
+             }
++        } catch (e: Exception) {
++            problem(e.message ?: e.javaClass.simpleName)
+         } finally {
++            runCatching { OneiosFailureReport.save(app, flow, state) }
+             if (answered) remember(app, null)
+             update(state.copy(flow = null, starting = false, stopping = false, pausedByUser = false))
+         }
+diff --git a/app-android/app/src/full/kotlin/com/fahadali/oneos/ui/OneiosToolActivity.kt b/app-android/app/src/full/kotlin/com/fahadali/oneos/ui/OneiosToolActivity.kt
+index 5612d2b..3f7617a 100644
+--- a/app-android/app/src/full/kotlin/com/fahadali/oneos/ui/OneiosToolActivity.kt
++++ b/app-android/app/src/full/kotlin/com/fahadali/oneos/ui/OneiosToolActivity.kt
+@@ -6,12 +6,15 @@ import android.os.Bundle
+ import android.view.View
+ import android.view.WindowManager
+ import android.widget.LinearLayout
++import android.widget.Toast
++import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.core.widget.NestedScrollView
+ import com.fahadali.oneos.R
+ import com.fahadali.oneos.core.model.OneiosTool
+ import com.fahadali.oneos.core.model.OneiosToolFlow
+ import com.fahadali.oneos.core.model.Units
+ import com.fahadali.oneos.session.OneiosToolJob
++import com.fahadali.oneos.session.OneiosFailureReport
+ import dev.oneuiproject.oneui.layout.ToolbarLayout
+ 
+ /**
+@@ -24,6 +27,17 @@ import dev.oneuiproject.oneui.layout.ToolbarLayout
+  */
+ class OneiosToolActivity : EdgeToEdgeActivity() {
+     private var unsubscribe: (() -> Unit)? = null
++    private val exportFailure = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
++        if (uri != null) {
++            val app = applicationContext
++            Thread({
++                val saved = runCatching { OneiosFailureReport.export(app, uri) }.isSuccess
++                runOnUiThread {
++                    Toast.makeText(app, if (saved) R.string.oneios_report_saved else R.string.oneios_report_export_failed, Toast.LENGTH_LONG).show()
++                }
++            }, "oneios-report-export").start()
++        }
++    }
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -143,6 +157,11 @@ class OneiosToolActivity : EdgeToEdgeActivity() {
+         }
+ 
+         val actions = PrebootCards.section(list)
++        if (!s.busy && OneiosFailureReport.available(this)) {
++            PrebootCards.row(actions, getString(R.string.oneios_export_failure_report)) {
++                exportFailure.launch("oneios-failure-report.txt")
++            }
++        }
+         val interrupted = OneiosToolJob.interrupted(this)
+         if (s.busy) {
+             // Pause and Resume when this tool takes them (its hello); the tool holds the request and keeps its parts.
+diff --git a/app-android/app/src/full/res/values/strings_oneios.xml b/app-android/app/src/full/res/values/strings_oneios.xml
+index e46482a..7142f71 100644
+--- a/app-android/app/src/full/res/values/strings_oneios.xml
++++ b/app-android/app/src/full/res/values/strings_oneios.xml
+@@ -40,6 +40,9 @@
+     <string name="oneios_image_question">Have you built the image set? It\'s the .tar.zst file OneiOS\'s scripts make from Apple\'s firmware. OneOS never downloads it.</string>
+     <!-- oneios-tool in the app (OneiosToolActivity, OneiosToolJob): what the tool sends, shown as it comes. -->
+     <string name="oneios_make_image">Make iOS image</string>
++    <string name="oneios_export_failure_report">Export last failure report</string>
++    <string name="oneios_report_saved">OneiOS failure report saved</string>
++    <string name="oneios_report_export_failed">Could not save the OneiOS failure report</string>
+     <string name="oneios_make_image_line">On this phone, from Apple\'s server: only the parts of the IPSW it needs</string>
+     <string name="oneios_image_choose">I have the file</string>
+     <string name="oneios_tool_sums">Check every file</string>
 diff --git a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
 index e6c7e06..48a13db 100644
 --- a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
@@ -153,3 +287,83 @@ index fae14d7..20a7031 100644
      }
  
      /** It is its own kind of system: no Android image or file set stands for it. */
+diff --git a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosFailureReport.kt b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosFailureReport.kt
+new file mode 100644
+--- /dev/null
++++ b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosFailureReport.kt
+@@ -0,0 +1,75 @@
++package com.fahadali.oneos.session
++
++import android.content.Context
++import android.net.Uri
++import android.os.Build
++import android.util.AtomicFile
++import com.fahadali.oneos.BuildConfig
++import com.fahadali.oneos.core.model.OneiosToolFlow
++import java.io.File
++import java.io.IOException
++import java.time.Instant
++
++/** The most recent failed tool run. The app saves this privately until the user exports it. */
++internal object OneiosFailureReport {
++    private const val OUTPUT_LIMIT = 256 * 1024
++
++    private fun file(context: Context) = AtomicFile(File(context.filesDir, "oneios-last-failure.txt"))
++
++    fun available(context: Context): Boolean = runCatching {
++        file(context).openRead().use { true }
++    }.getOrDefault(false)
++
++    fun save(context: Context, flow: OneiosToolJob.Flow, state: OneiosToolJob.State) {
++        val view = state.view
++        if (state.problem == null && state.refusals.isEmpty() &&
++            view.end !in setOf(OneiosToolFlow.End.REFUSED, OneiosToolFlow.End.FAILED, OneiosToolFlow.End.LOST)
++        ) return
++        val report = buildString {
++            appendLine("OneiOS failure report")
++            appendLine("Time: ${Instant.now()}")
++            appendLine("OneOS: ${BuildConfig.VERSION_NAME}")
++            appendLine("Device: ${Build.MODEL} (${Build.DEVICE}), Android ${Build.VERSION.RELEASE}, ${Build.ID}")
++            appendLine("Operation: ${flow.name}")
++            state.toolVersion?.let { appendLine("Tool: $it") }
++            flow.requests.getOrNull(state.request - 1)?.let { appendLine("Request: ${it.cmd}") }
++            view.end?.let { appendLine("Result: $it") }
++            view.code?.let { appendLine("Error code: $it") }
++            state.problem?.let { appendLine("App: $it") }
++            view.text?.let { appendLine("Tool: $it") }
++            view.spaceNeed?.let { appendLine("Space needed: $it bytes") }
++            view.spaceFree?.let { appendLine("Space available: $it bytes") }
++            when (view.code) {
++                "prepared-inputs" -> appendLine("Diagnosis: a required prepared image input is missing or invalid. See the tool error for the input path.")
++                "space" -> appendLine("Diagnosis: the device has insufficient free space for this step.")
++                "mismatch" -> appendLine("Diagnosis: a file differs from the value recorded by the runtime or image profile.")
++                "unknown", "not-ported" -> appendLine("Diagnosis: the installed runtime does not implement this step.")
++            }
++            view.steps.forEach { appendLine("Step ${it.id}: ${it.state}") }
++            state.refusals.forEach { appendLine("Request error: $it") }
++            if (view.lines.isNotEmpty()) {
++                appendLine()
++                appendLine("Recent output")
++                val output = view.lines.takeLast(200).joinToString("\n") { it.takeLast(2048) }
++                if (output.length > OUTPUT_LIMIT) appendLine("[Older output omitted]")
++                appendLine(output.takeLast(OUTPUT_LIMIT))
++            }
++        }
++        val destination = file(context)
++        val stream = destination.startWrite()
++        try {
++            stream.write(report.toByteArray(Charsets.UTF_8))
++            destination.finishWrite(stream)
++        } catch (e: IOException) {
++            destination.failWrite(stream)
++            throw e
++        }
++    }
++
++    fun export(context: Context, uri: Uri) {
++        file(context).openRead().use { input ->
++            val output = context.contentResolver.openOutputStream(uri, "wt") ?: throw IOException("Cannot open export destination")
++            output.use { input.copyTo(it) }
++        }
++    }
++}
