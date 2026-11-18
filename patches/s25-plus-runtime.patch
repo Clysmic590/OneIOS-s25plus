@@ -1,0 +1,866 @@
+diff --git a/runtime/package.sh b/runtime/package.sh
+index 9fe2a4a..403d282 100755
+--- a/runtime/package.sh
++++ b/runtime/package.sh
+@@ -130,6 +130,23 @@ mkdir -p "$STAGE/lib/profiles"
+ for p in "$ROOT"/profiles/*.toml; do n=${p##*/}; cp "$p" "$STAGE/lib/profiles/$(echo "$n" | tr , -)"; done
+ chmod 0644 "$STAGE"/lib/profiles/*.toml
+ 
++if [ "${ONEIOS_BUILD_AEA:-0}" = 1 ]; then
++  bash "$ROOT/runtime/aea/build.sh" "$STAGE/bin/oneios-aea"
++fi
++
++if [ "${ONEIOS_BUILD_PRELINK_INPUTS:-0}" = 1 ]; then
++  "$ROOT/scripts/setup/get-references.sh" XnuPrelink
++  x=$ROOT/external/XnuPrelink
++  p=$STAGE/lib/prelink
++  mkdir -p "$p/xnuprelink/fixtures" "$p/reviewed"
++  cp "$ROOT/kernel/unixnu/profiles/os/ios-27.0.1-24A446/profile.toml" "$p/"
++  cp "$ROOT"/kernel/prelink/{pairs-24A446,stubs-24A446,reviewed-24A446-v54}.json "$p/"
++  cp "$ROOT"/kernel/prelink/{lead,user}/reviewed-*-24A446-*.json "$p/reviewed/"
++  cp "$x"/{fileset_match,kc_image,fileset_shape}.py "$p/xnuprelink/"
++  cp "$x"/fixtures/fileset-*-symbols.json "$p/xnuprelink/fixtures/"
++  cp "$x/LICENSE" "$p/xnuprelink/"
++fi
++
+ # 2. Scripts (0755 when they have a #! line).
+ if [ -d "$ROOT/runtime/scripts" ] && [ -n "$(ls -A "$ROOT/runtime/scripts")" ]; then
+   mkdir -p "$STAGE/scripts"
+diff --git a/runtime/xnuhost/tools/gpuctl.c b/runtime/xnuhost/tools/gpuctl.c
+index 83682c9..0c1b185 100644
+--- a/runtime/xnuhost/tools/gpuctl.c
++++ b/runtime/xnuhost/tools/gpuctl.c
+@@ -276,7 +276,14 @@ static uint32_t seqno;
+ static int ccmd(uint32_t ctx, void *request, uint32_t size, void *rsp, uint32_t rsp_size)
+ {
+   ccmd_req *hdr = request;
+-  uint8_t *rsp_mem = (uint8_t *)shmem + shmem->rsp_mem_offset;
++  uint8_t *rsp_mem = NULL;
++  if (rsp) {
++    uint32_t offset = shmem->rsp_mem_offset;
++    if (offset < sizeof *shmem || offset > SHMEM_BYTES ||
++        rsp_size < sizeof rsp_size || rsp_size > SHMEM_BYTES - offset)
++      return -EIO;
++    rsp_mem = (uint8_t *)shmem + offset;
++  }
+   hdr->len = size;
+   hdr->seqno = ++seqno;
+   hdr->rsp_off = 0;
+@@ -292,6 +299,7 @@ static int ioctl_simple(uint32_t ctx, uint32_t nr, void *payload, uint32_t size)
+ {
+   struct { ccmd_req hdr; uint32_t cmd; uint8_t payload[28]; } req = { .hdr.cmd = CCMD_IOCTL_SIMPLE, .cmd = nr };
+   struct { uint32_t len; int32_t ret; uint8_t payload[24]; } rsp = { 0 };
++  if (size > sizeof rsp.payload) return -EINVAL;
+   memcpy(req.payload, payload, size);
+   int r = ccmd(ctx, &req, (uint32_t)(sizeof req.hdr + 4 + size + 3) & ~3u, &rsp, 8 + size);
+   if (r) return r;
+@@ -394,6 +402,7 @@ static int guest_buffer(uint32_t ctx, uint32_t res, uint32_t blob, uint64_t iova
+ // 32 CP_NOPs at `offset` of the buffer `res` (bound at `iova`, its bytes at `words`), run by the GPU; its fence retired.
+ static int run_nops(uint32_t ctx, uint32_t queue, uint32_t res, uint64_t iova, uint32_t offset, uint32_t *words, uint32_t fence)
+ {
++  puts("submit: writing the command buffer");
+   for (unsigned i = 0; i < 64; i += 2) { words[i] = pkt7(0x10 /* CP_NOP */, 1); words[i + 1] = 0x6f6e6569; }
+   struct {
+     ccmd_req hdr;
+@@ -406,10 +415,13 @@ static int run_nops(uint32_t ctx, uint32_t queue, uint32_t res, uint64_t iova, u
+   };
+   struct timespec start, end;
+   uint64_t value = 0, before = 0;
++  puts("submit: reading the initial GPU fault count");
+   bool counted = get_param(ctx, 0x09 /* FAULTS */, &before) == 0;
+   clock_gettime(CLOCK_MONOTONIC, &start);
++  puts("submit: sending GEM_SUBMIT");
+   int r = ccmd(ctx, &job, sizeof job, NULL, 0);
+   STEP("GEM_SUBMIT (32 CP_NOPs)", r == 0 && shmem->async_error == 0, "%d, async errors %u: KGSL refused the command", r, shmem->async_error);
++  puts("submit: registering the completion fence");
+   r = gpu->submit_fence(gpu, ctx, 1, fence);         // the queue's ring: priority 0 is ring 1
+   STEP("the fence", r == 0, "%s", strerror(-r));
+   struct timespec until;
+@@ -420,6 +432,7 @@ static int run_nops(uint32_t ctx, uint32_t queue, uint32_t res, uint64_t iova, u
+   pthread_mutex_unlock(&lock);
+   clock_gettime(CLOCK_MONOTONIC, &end);
+   STEP("the fence retiring", r == 0, "not within 5 s: the GPU did not run the command, or KGSL did not report it");
++  puts("submit: reading the final GPU fault count");
+   r = get_param(ctx, 0x09 /* FAULTS */, &value);
+   printf("submit: queue %u, 256 bytes of commands at 0x%llx run by the GPU, fence retired after %.2f ms; GPU faults %llu, async errors %u\n", queue,
+          (unsigned long long)(iova + offset), (double)(end.tv_sec - start.tv_sec) * 1e3 + (double)(end.tv_nsec - start.tv_nsec) / 1e6,
+diff --git a/tools/oneios-tool/Cargo.lock b/tools/oneios-tool/Cargo.lock
+index 847c6cf..ab85230 100644
+--- a/tools/oneios-tool/Cargo.lock
++++ b/tools/oneios-tool/Cargo.lock
+@@ -1168,10 +1168,12 @@ dependencies = [
+  "oneios-package",
+  "oneios-phone",
+  "oneios-prelink",
++ "plist",
+  "rayon",
+  "regex",
+  "serde_json",
+  "sha2 0.10.9",
++ "toml",
+ ]
+ 
+ [[package]]
+diff --git a/tools/oneios-tool/crates/oneios-image/src/ipsw.rs b/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
+index 8601fe7..dd9b07c 100644
+--- a/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
++++ b/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
+@@ -161,7 +161,7 @@ pub fn cmd_check_ipsw(profile_path: &str, given: Option<&str>) -> Result<(), Fai
+ }
+ 
+ /// The SHA-256 and the SHA-384 of a file, in one pass.
+-fn digest_file(path: &str) -> Result<(String, String), Fail> {
++pub(crate) fn digest_file(path: &str) -> Result<(String, String), Fail> {
+     use std::io::Read;
+     let mut file = std::fs::File::open(path).map_err(|e| crash!("{}", py::os_error(&e, path)))?;
+     let (mut a, mut b, mut block) = (Sha256::new(), Sha384::new(), vec![0u8; 1 << 22]);
+diff --git a/tools/oneios-tool/crates/oneios-image/src/lib.rs b/tools/oneios-tool/crates/oneios-image/src/lib.rs
+index a8ac115..099859c 100644
+--- a/tools/oneios-tool/crates/oneios-image/src/lib.rs
++++ b/tools/oneios-tool/crates/oneios-image/src/lib.rs
+@@ -18,6 +18,7 @@
+ 
+ pub mod apfs;
+ pub mod apfs_tools;
++pub mod assemble;
+ #[cfg(test)]
+ mod fixtures;
+ mod hashes;
+diff --git a/tools/oneios-tool/crates/oneios-image/src/transfer.rs b/tools/oneios-tool/crates/oneios-image/src/transfer.rs
+index a1f4a27..89fd51c 100644
+--- a/tools/oneios-tool/crates/oneios-image/src/transfer.rs
++++ b/tools/oneios-tool/crates/oneios-image/src/transfer.rs
+@@ -379,7 +379,11 @@ impl Ranges {
+ /// request on a new connection (the module comment), so the pieces are few; four per connection so that a slow
+ /// connection holds up only its own piece.
+ fn piece_size(length: u64, connections: usize) -> u64 {
+-    (length / (4 * connections.max(1) as u64)).clamp(8 << 20, 256 << 20).next_multiple_of(1 << 20)
++    // Some connections deliver short ranges reliably but throttle long responses.
++    let max_mib = std::env::var("ONEIOS_FETCH_RANGE_MIB").ok()
++        .and_then(|value| value.parse::<u64>().ok()).filter(|n| (8..=256).contains(n))
++        .unwrap_or(256);
++    (length / (4 * connections.max(1) as u64)).clamp(8 << 20, max_mib << 20).next_multiple_of(1 << 20)
+ }
+ 
+ // ---------------------------------------------------------------- the state file
+diff --git a/tools/oneios-tool/crates/oneios-serve/Cargo.toml b/tools/oneios-tool/crates/oneios-serve/Cargo.toml
+index 3133090..45674df 100644
+--- a/tools/oneios-tool/crates/oneios-serve/Cargo.toml
++++ b/tools/oneios-tool/crates/oneios-serve/Cargo.toml
+@@ -10,6 +10,8 @@ libc.workspace = true
+ rayon.workspace = true
+ serde_json.workspace = true
+ sha2.workspace = true
++plist = { version = "1", default-features = false }
++toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+ # zip-ls's pattern
+ regex = "1"
+ oneios-common.workspace = true
+diff --git a/tools/oneios-tool/crates/oneios-serve/src/cmds.rs b/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
+index cf3ef13..3088bc3 100644
+--- a/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
++++ b/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
+@@ -46,6 +46,8 @@ pub static ALL: &[Spec] = &[
+     Spec { name: "apfs-ls", heavy: false, pausable: false, steps: &[], run: apfs_ls },
+     Spec { name: "apfs-copy", heavy: true, pausable: false, steps: &[("scan", "Reading the volume"), ("copy", "Copying the files"), ("place", "Putting the folder in place")], run: apfs_copy },
+     Spec { name: "tweaks", heavy: true, pausable: false, steps: &[], run: tweaks },
++    Spec { name: "make-image", heavy: true, pausable: false, steps: &[("decrypt", "Decrypting firmware volumes"), ("kernel", "Building the kernel collection"), ("seed", "Packing the Data seed"), ("copy", "Copying prepared image files"), ("verify", "Verifying image and manifest"), ("stage", "Recording verified files")], run: make_image },
++    Spec { name: "launchd-overrides", heavy: true, pausable: false, steps: &[("policy", "Preparing launchd overrides")], run: launchd_overrides },
+     Spec { name: "prelink", heavy: true, pausable: false, steps: &oneios_prelink::build::STEPS, run: prelink },
+     Spec { name: "stubs-check", heavy: true, pausable: false, steps: &[("check", "Checking the stubs")], run: stubs_check },
+     Spec { name: "package-check", heavy: true, pausable: false, steps: &[("check", "Checking the runtime's files")], run: package_check },
+@@ -782,6 +784,190 @@ fn tweaks(_: &Rq) -> Result<Done, Fail> {
+     ))
+ }
+ 
++fn make_image(rq: &Rq) -> Result<Done, Fail> {
++    use oneios_image::assemble;
++    let indir = rq.write_path("indir")?;
++    let work = rq.write_path("work")?;
++    let out = rq.write_path("out")?;
++    let sums = rq.write_path("sums_list")?;
++    let ids = rq.write_path("ids_list")?;
++    rq.req.done()?;
++    let stage = Path::new(&rq.cx.stage);
++    for (path, required) in [
++        (&indir, "make/inputs"), (&work, "make"), (&out, "image.new"),
++        (&sums, "image.new.sha256"), (&ids, "image.new.ids"),
++    ] {
++        if Path::new(path) != stage.join(required) {
++            return Err(Fail::usage(format!("make-image: expected stage path {required}")));
++        }
++    }
++    let prepared = stage.join("make/prepared");
++    let profile = stage.join("runtime/lib/profiles/ios-27.0.1-iPhone18-2.toml");
++    rq.cx.may_write(prepared.to_str().ok_or_else(|| Fail::usage("Invalid prepared path"))?)
++        .map_err(|why| Fail::refused("outside", why))?;
++    let out_dir = Path::new(&out);
++    if std::fs::read_dir(out_dir).map_err(|e| io(&out, e))?.next().is_some() {
++        return Err(Fail::refused("exists", "image.new is not empty; start a new staging operation"));
++    }
++    let helper = stage.join("runtime/bin/oneios-aea");
++    if helper.exists() {
++        let expected = std::fs::read_to_string(stage.join("runtime.sha256")).map_err(|e| io("runtime.sha256", e))?;
++        let want = expected.lines().filter_map(|line| line.split_once("  "))
++            .find_map(|(sha, path)| (path == "bin/oneios-aea").then_some(sha));
++        if want != Some(oneios_image::sha256_of(&helper.to_string_lossy()).map_err(image_fail)?.as_str()) {
++            return Err(Fail::refused("mismatch", "The AEA helper does not match the staged runtime"));
++        }
++        let scratch = out_dir.join("decrypt");
++        std::fs::create_dir(&scratch).map_err(|e| io("decrypt work folder", e))?;
++        let guard = job::temp(scratch);
++        job::step("decrypt");
++        assemble::decrypt_members(&profile.to_string_lossy(), Path::new(&indir), &helper, guard.path())
++            .map_err(image_fail)?;
++    }
++    let kernel_work = if !prepared.join("kernel.kc").exists() && stage.join("runtime/lib/prelink").is_dir() {
++        let scratch = out_dir.join("prelink");
++        std::fs::create_dir(&scratch).map_err(|e| io("prelink work folder", e))?;
++        let guard = job::temp(scratch);
++        let kernel = build_image_kernel(rq, stage, &profile, Path::new(&indir), guard.path())?;
++        Some((guard, kernel))
++    } else {
++        None
++    };
++    let seed_work = if !prepared.join("data.seed").exists() && prepared.join("tweaked-data").is_dir() {
++        let scratch = out_dir.join("seed");
++        std::fs::create_dir(&scratch).map_err(|e| io("seed work folder", e))?;
++        let guard = job::temp(scratch);
++        let seed = build_image_seed(&profile, Path::new(&indir), &prepared, guard.path())?;
++        Some((guard, seed))
++    } else {
++        None
++    };
++    let inputs = assemble::Prepared::open(&profile.to_string_lossy(), Path::new(&indir), &prepared,
++        kernel_work.as_ref().map(|(_, kernel)| Path::new(kernel)),
++        seed_work.as_ref().map(|(_, seed)| seed.as_path()))
++        .map_err(|e| Fail::refused("prepared-inputs", format!("Make iOS image needs decrypted volumes recorded in inputs.json and a prepared Data seed and kernel collection: {e}")))?;
++    rq.space(out_dir, inputs.bytes.saturating_add(64 << 20))?;
++    let part = format!("{out}.part");
++    rq.cx.may_write(&part).map_err(|why| Fail::refused("outside", why))?;
++    std::fs::create_dir(&part).map_err(|e| io(&part, e))?;
++    let guard = job::temp(&part);
++    let (version, build, format) = inputs.build(guard.path()).map_err(image_fail)?;
++    drop(kernel_work);
++    drop(seed_work);
++    job::step("stage");
++    let files = assemble::files(&part).map_err(image_fail)?;
++    let mut sums_text = String::new();
++    let mut ids_text = String::new();
++    for name in &files {
++        check()?;
++        let path = guard.path().join(name);
++        let sha = oneios_image::sha256_of(&path.to_string_lossy()).map_err(image_fail)?;
++        let m = std::fs::metadata(&path).map_err(|e| io(name, e))?;
++        sums_text.push_str(&format!("{sha}  {name}\n"));
++        ids_text.push_str(&format!("{}:{}:{}:{} {name}\n", m.dev(), m.ino(), m.size(), m.mtime()));
++    }
++    check()?;
++    for (path, text) in [(&sums, sums_text), (&ids, ids_text)] {
++        let mut file = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
++            .open(path).map_err(|e| io(path, e))?;
++        if !file.metadata().map_err(|e| io(path, e))?.is_file() {
++            return Err(Fail::refused("outside", format!("{path}: expected a regular staging list")));
++        }
++        file.set_len(0).and_then(|_| file.write_all(text.as_bytes())).map_err(|e| io(path, e))?;
++    }
++    std::fs::rename(guard.path(), out_dir).map_err(|e| io(&out, e))?;
++    guard.keep();
++    Ok(Done::new(format!("Verified {files_count} image files for iOS {version}", files_count = files.len()))
++        .f("files", files.len()).f("format", format).f("version", version).f("build", build))
++}
++
++fn build_image_seed(profile: &Path, inputs: &Path, prepared: &Path, scratch: &Path) -> Result<std::path::PathBuf, Fail> {
++    let (image, epoch) = oneios_image::assemble::seed_input(&profile.to_string_lossy(), inputs).map_err(image_fail)?;
++    let cache = scratch.join("launchd.plist");
++    job::step("seed");
++    oneios_image::apfs_tools::copy_to(&image.to_string_lossy(), "System/Library/xpc/launchd.plist",
++        &cache.to_string_lossy(), None, Pick::Block0).map_err(image_fail)?;
++    oneios_image::assemble::pack_seed_with_overrides(prepared, scratch, epoch, |existing| {
++        crate::launchd::overrides(&cache, existing, &[]).map(|overrides| overrides.bytes)
++    }).map_err(image_fail)
++}
++
++fn build_image_kernel(rq: &Rq, stage: &Path, profile: &Path, inputs: &Path, out: &Path) -> Result<String, Fail> {
++    use oneios_prelink::build;
++    let native = stage.join("runtime/kernel/xnu.macho");
++    if !native.is_file() {
++        return Err(Fail::refused("not-found", "This runtime does not carry a hosted XNU kernel for prelinking"));
++    }
++    let config = stage.join("runtime/lib/prelink");
++    let mut reviewed = Vec::new();
++    for entry in std::fs::read_dir(config.join("reviewed")).map_err(|e| io("reviewed prelink records", e))? {
++        let entry = entry.map_err(|e| io("reviewed prelink record", e))?;
++        if entry.path().extension().is_some_and(|ext| ext == "json") {
++            reviewed.push(entry.path().to_string_lossy().into_owned());
++        }
++    }
++    reviewed.sort_unstable();
++    let cache = oneios_image::assemble::kernelcache(&profile.to_string_lossy(), inputs).map_err(image_fail)?;
++    let decoded = out.join("kernelcache.macho").to_string_lossy().into_owned();
++    rq.space(out, 2 << 30)?;
++    check()?;
++    job::step("kernel");
++    oneios_image::im4p::cmd(&cache.to_string_lossy(), &decoded).map_err(image_fail)?;
++    let args = build::Args {
++        kernel: native.to_string_lossy().into_owned(),
++        kernelcache: decoded,
++        profile: config.join("profile.toml").to_string_lossy().into_owned(),
++        reviewed: config.join("reviewed-24A446-v54.json").to_string_lossy().into_owned(),
++        more_reviewed: reviewed,
++        pairs: config.join("pairs-24A446.json").to_string_lossy().into_owned(),
++        stubs: config.join("stubs-24A446.json").to_string_lossy().into_owned(),
++        xnuprelink: config.join("xnuprelink").to_string_lossy().into_owned(),
++        reference: None,
++        out: out.to_string_lossy().into_owned(),
++        repo: None,
++        no_git: true,
++        oneios_commit: None,
++        xnuprelink_commit: None,
++        remove_work: true,
++    };
++    let built = build::build(&args).map_err(|e| Fail::failed(format!("{e:#}")))?;
++    Ok(built.kc)
++}
++
++fn launchd_overrides(rq: &Rq) -> Result<Done, Fail> {
++    let cache = rq.existing("cache")?;
++    let existing = rq.req.opt_str("existing")?.map(|_| rq.existing("existing")).transpose()?;
++    let jetsam = rq.req.list("jetsam")?;
++    for path in &jetsam {
++        crate::plain_path(path).map_err(Fail::usage)?;
++    }
++    let out = rq.write_path("out")?;
++    rq.req.done()?;
++    let part = format!("{out}.part");
++    rq.cx.may_write(&part).map_err(|why| Fail::refused("outside", why))?;
++    fresh(&out)?;
++    job::step("policy");
++    let policy = crate::launchd::overrides(Path::new(&cache), existing.as_deref().map(Path::new), &jetsam)
++        .map_err(Fail::failed)?;
++    check()?;
++    std::fs::create_dir(&part).map_err(|e| io(&part, e))?;
++    let guard = job::temp(&part);
++    let dir = guard.path();
++    let overrides = dir.join("disabled.plist");
++    let marker = dir.join("disabled.migrated");
++    std::fs::write(&overrides, policy.bytes).map_err(|e| io("disabled.plist", e))?;
++    std::fs::write(&marker, []).map_err(|e| io("disabled.migrated", e))?;
++    for path in [&overrides, &marker] {
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
++            .map_err(|e| io("launchd override permissions", e))?;
++    }
++    check()?;
++    std::fs::rename(dir, &out).map_err(|e| io(&out, e))?;
++    guard.keep();
++    Ok(Done::new(format!("Prepared launchd overrides for {} jobs", policy.disabled.len()))
++        .f("disabled", policy.disabled).f("force_enabled", policy.force_enabled))
++}
++
+ fn prelink(rq: &Rq) -> Result<Done, Fail> {
+     use oneios_prelink::build::{self, Refused};
+     let args = build::Args {
+diff --git a/tools/oneios-tool/crates/oneios-serve/src/lib.rs b/tools/oneios-tool/crates/oneios-serve/src/lib.rs
+index 43e94db..dd9a21a 100644
+--- a/tools/oneios-tool/crates/oneios-serve/src/lib.rs
++++ b/tools/oneios-tool/crates/oneios-serve/src/lib.rs
+@@ -14,6 +14,7 @@
+ 
+ mod capture;
+ mod cmds;
++mod launchd;
+ pub mod proto;
+ 
+ use capture::Capture;
+diff --git a/runtime/aea/build.sh b/runtime/aea/build.sh
+new file mode 100644
+--- /dev/null
++++ b/runtime/aea/build.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++# Build the narrow Android helper against Blacktop's pinned MIT AEA library.
++set -euo pipefail
++root=$(cd "$(dirname "$0")/../.." && pwd)
++out=$(realpath -m "${1:?output path required}")
++cc=${CC_aarch64_linux_android:?set the Android NDK arm64 compiler}
++pin=b2c156960c79b0eefe0885dbb32cce7eef77cf2d
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++git -C "$work" init -q
++git -C "$work" fetch --depth 1 https://github.com/blacktop/ipsw.git "$pin"
++git -C "$work" checkout -q --detach "$pin"
++mkdir "$work/oneios-aea"
++cp "$root/runtime/aea/main.go" "$work/oneios-aea/main.go"
++cd "$work"
++CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$cc" go build -mod=readonly -buildmode=pie -trimpath -ldflags='-s -w' -o "$out" ./oneios-aea
++cp LICENSE "$(dirname "$out")/../LICENSE-blacktop-ipsw"
+diff --git a/runtime/aea/main.go b/runtime/aea/main.go
+new file mode 100644
+--- /dev/null
++++ b/runtime/aea/main.go
+@@ -0,0 +1,70 @@
++// oneios-aea is the narrow firmware decryptor shipped with the OneiOS runtime.
++package main
++
++import (
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/blacktop/ipsw/pkg/aea"
++)
++
++func appleURL(u *url.URL) bool {
++	host := strings.ToLower(u.Hostname())
++	return u.Scheme == "https" && u.User == nil &&
++		(u.Port() == "" || u.Port() == "443") &&
++		(host == "apple.com" || strings.HasSuffix(host, ".apple.com"))
++}
++
++func decrypt(input, output string) error {
++	metadata, err := aea.Info(input)
++	if err != nil {
++		return err
++	}
++	keyURL, err := url.Parse(string(metadata["com.apple.wkms.fcs-key-url"]))
++	if err != nil || !appleURL(keyURL) {
++		return fmt.Errorf("expected an HTTPS Apple firmware key URL")
++	}
++	client := &http.Client{
++		Timeout: 30 * time.Second,
++		CheckRedirect: func(req *http.Request, via []*http.Request) error {
++			if len(via) >= 5 || !appleURL(req.URL) {
++				return fmt.Errorf("refused firmware key redirect")
++			}
++			return nil
++		},
++	}
++	response, err := client.Get(keyURL.String())
++	if err != nil {
++		return err
++	}
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		return fmt.Errorf("Apple key service returned %s", response.Status)
++	}
++	const limit = 32 << 10
++	key, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
++	if err != nil {
++		return err
++	}
++	if len(key) == 0 || len(key) > limit {
++		return fmt.Errorf("Apple key service returned an invalid response size")
++	}
++	_, err = aea.Decrypt(&aea.DecryptConfig{Input: input, Output: output, PrivKeyData: key})
++	return err
++}
++
++func main() {
++	if len(os.Args) != 3 || !strings.HasSuffix(os.Args[1], ".aea") {
++		fmt.Fprintln(os.Stderr, "usage: oneios-aea INPUT.aea OUTPUT_DIRECTORY")
++		os.Exit(2)
++	}
++	if err := decrypt(os.Args[1], os.Args[2]); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
+diff --git a/tools/oneios-tool/crates/oneios-image/src/assemble.rs b/tools/oneios-tool/crates/oneios-image/src/assemble.rs
+new file mode 100644
+--- /dev/null
++++ b/tools/oneios-tool/crates/oneios-image/src/assemble.rs
+@@ -0,0 +1,276 @@
++//! Assemble an image set from the verified fetch and prepared build outputs.
++
++use crate::{err, ipsw, manifest, profile, Fail};
++use oneios_common::{job, pyjson};
++use std::fs::{self, File, OpenOptions};
++use std::io::{Read, Write};
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++use std::path::Path;
++
++pub struct Prepared {
++    profile: profile::Profile,
++    record: pyjson::Value,
++    files: Vec<(std::path::PathBuf, String, Option<String>)>,
++    pub bytes: u64,
++}
++
++impl Prepared {
++    pub fn open(profile_path: &str, inputs: &Path, build: &Path, kernel: Option<&Path>, seed: Option<&Path>) -> Result<Self, Fail> {
++        let profile = profile::load_profile(profile_path)?;
++        let record_path = inputs.join("inputs.json");
++        let record = pyjson::load(&record_path).map_err(|e| err!("{}: {e}", record_path.display()))?;
++        if record.get("build").and_then(pyjson::Value::as_str) != Some(profile.text("os", "build")) {
++            return Err(err!("{}: the fetch record is for another build", record_path.display()));
++        }
++        let mut files = Vec::new();
++        let mut bytes = 0u64;
++        let names = profile.table("image").get("files").and_then(pyjson::Value::as_dict).ok_or(Fail::Usage)?;
++        for (role, name) in names {
++            let member = profile.member_of(role).ok_or(Fail::Usage)?;
++            let name = name.as_str().ok_or(Fail::Usage)?;
++            let source = inputs.join(profile::input_name(member));
++            let encrypted = member.get("aea").and_then(pyjson::Value::as_bool) == Some(true);
++            let rec = record.get("members").and_then(|members| members.get(role));
++            let expected = if encrypted {
++                rec.and_then(|r| r.get("plain_sha256")).and_then(pyjson::Value::as_str)
++            } else {
++                member.get("sha384").or_else(|| member.get("sha256")).and_then(pyjson::Value::as_str)
++            };
++            let expected = expected.ok_or_else(|| err!("{role}: missing verified input digest"))?;
++            bytes = bytes.saturating_add(file_size(&source)?);
++            files.push((source, name.to_owned(), Some(expected.to_owned())));
++        }
++        for key in ["kernel", "seed"] {
++            let name = profile.text("image", key);
++            let prepared_file = if key == "kernel" { kernel } else { seed };
++            let source = prepared_file.map(Path::to_owned).unwrap_or_else(|| build.join(name));
++            bytes = bytes.saturating_add(file_size(&source)?);
++            files.push((source, name.to_owned(), None));
++        }
++        let overlay = build.join("overlay");
++        match fs::symlink_metadata(&overlay) {
++            Ok(meta) if meta.is_dir() => collect_overlay(build, &overlay, &mut files, &mut bytes)?,
++            Ok(_) => return Err(err!("{}: expected a directory", overlay.display())),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            Err(e) => return Err(err!("{}: {e}", overlay.display())),
++        }
++        Ok(Self { profile, record, files, bytes })
++    }
++
++    pub fn build(self, out: &Path) -> Result<(String, String, u64), Fail> {
++        job::begin("copy", "bytes", self.bytes);
++        for (source, name, expected) in self.files {
++            let dest = out.join(&name);
++            copy_file(&source, &dest)?;
++            if let Some(expected) = expected {
++                let (sha256, sha384) = ipsw::digest_file(dest.to_str().ok_or(Fail::Usage)?)?;
++                if expected != sha256 && expected != sha384 {
++                    return Err(err!("{}: differs from the verified input", source.display()));
++                }
++            }
++        }
++        job::end();
++        job::step("verify");
++        let out = out.to_str().ok_or(Fail::Usage)?;
++        manifest::make_manifest(&self.profile, out, Some(self.record), None, None)?;
++        manifest::verify_dir(out, false)?;
++        Ok((self.profile.text("os", "version").to_owned(), self.profile.text("os", "build").to_owned(), profile::FORMAT as u64))
++    }
++}
++
++pub fn seed_input(profile_path: &str, inputs: &Path) -> Result<(std::path::PathBuf, i128), Fail> {
++    let profile = profile::load_profile(profile_path)?;
++    let os = profile.member_of("os").ok_or(Fail::Usage)?;
++    let epoch = profile.table("data").get("epoch").and_then(pyjson::Value::as_int).ok_or(Fail::Usage)?;
++    Ok((inputs.join(profile::input_name(os)), epoch))
++}
++
++pub fn pack_seed_with_overrides(
++    prepared: &Path, scratch: &Path, epoch: i128,
++    make_overrides: impl FnOnce(Option<&Path>) -> Result<Vec<u8>, String>,
++) -> Result<std::path::PathBuf, Fail> {
++    let tree = scratch.join("data");
++    let text = |p: &Path| p.to_string_lossy().into_owned();
++    let source = prepared.join("tweaked-data");
++    if !fs::symlink_metadata(&source).is_ok_and(|m| m.is_dir()) {
++        return Err(err!("{}: expected a prepared Data tree", source.display()));
++    }
++    crate::seed::tree_copy(&text(&source), &text(&tree),
++        &text(&scratch.join("copy-meta.json")), None, "")?;
++    let meta = prepared.join("data.meta.json");
++    let rules = prepared.join("owners.tsv");
++    let mut owners = fs::read_to_string(&rules).map_err(|e| err!("{}: {e}", rules.display()))?;
++    let mut folder = tree;
++    for entry in ["db", "com.apple.xpc.launchd"] {
++        folder.push(entry);
++        match fs::symlink_metadata(&folder) {
++            Ok(m) if m.is_dir() => {}
++            Ok(_) => return Err(err!("{}: expected a regular directory", folder.display())),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++                fs::create_dir(&folder).map_err(|e| err!("{}: {e}", folder.display()))?;
++            }
++            Err(e) => return Err(err!("{}: {e}", folder.display())),
++        }
++    }
++    let existing = folder.join("disabled.plist");
++    let existing = match fs::symlink_metadata(&existing) {
++        Ok(m) if m.is_file() => Some(existing.as_path()),
++        Ok(_) => return Err(err!("{}: expected a regular plist", existing.display())),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
++        Err(e) => return Err(err!("{}: {e}", existing.display())),
++    };
++    let overrides = make_overrides(existing).map_err(Fail::Error)?;
++    for (name, contents) in [("disabled.plist", overrides.as_slice()), ("disabled.migrated", &[][..])] {
++        let path = folder.join(name);
++        let mut output = OpenOptions::new().write(true).create(true).truncate(true)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)
++            .map_err(|e| err!("{}: {e}", path.display()))?;
++        output.write_all(contents).map_err(|e| err!("{}: {e}", path.display()))?;
++    }
++    owners.push_str("\ndb/com.apple.xpc.launchd\t0\t0\t0755\ndb/com.apple.xpc.launchd/disabled.plist\t0\t0\t0644\ndb/com.apple.xpc.launchd/disabled.migrated\t0\t0\t0644\n");
++    let merged = scratch.join("owners.tsv");
++    fs::write(&merged, owners).map_err(|e| err!("{}: {e}", merged.display()))?;
++    let out = scratch.join("data.seed");
++    crate::seed::seed_pack(&text(&scratch.join("data")), &text(&meta), &text(&out), epoch, Some(&text(&merged)))?;
++    Ok(out)
++}
++
++/// Locate the kernelcache member from the same profile used to fetch it.
++pub fn kernelcache(profile_path: &str, inputs: &Path) -> Result<std::path::PathBuf, Fail> {
++    let profile = profile::load_profile(profile_path)?;
++    let member = profile.member_of("kernelcache").ok_or(Fail::Usage)?;
++    let path = inputs.join(profile::input_name(member));
++    if file_size(&path)? != member.get("size").and_then(pyjson::Value::as_u64).ok_or(Fail::Usage)? {
++        return Err(err!("{}: kernelcache member has the wrong size", path.display()));
++    }
++    Ok(path)
++}
++
++pub fn files(out: &str) -> Result<Vec<String>, Fail> {
++    let mut files = manifest::set_files(out)?;
++    files.push("manifest.json".into());
++    Ok(files)
++}
++
++/// Decrypt only AEA members previously downloaded and recorded by fetch.
++pub fn decrypt_members(
++    profile_path: &str, inputs: &Path, helper: &Path, scratch: &Path,
++) -> Result<(), Fail> {
++    let profile = profile::load_profile(profile_path)?;
++    let record = pyjson::load(inputs.join("inputs.json")).map_err(|e| err!("{e}"))?;
++    if record.get("build").and_then(pyjson::Value::as_str) != Some(profile.text("os", "build")) {
++        return Err(err!("The fetch record is for another iOS build"));
++    }
++    for member in profile.members() {
++        if member.get("aea").and_then(pyjson::Value::as_bool) != Some(true) {
++            continue;
++        }
++        let role = member.get("role").and_then(pyjson::Value::as_str).ok_or(Fail::Usage)?;
++        let name = member.get("path").and_then(pyjson::Value::as_str).ok_or(Fail::Usage)?;
++        let entry = record.get("members").and_then(|entries| entries.get(role))
++            .ok_or_else(|| err!("Fetch has not recorded {role}"))?;
++        let plain_name = profile::input_name(member);
++        let plain = inputs.join(&plain_name);
++        if entry.get("plain_sha256").is_some() && file_size(&plain).is_ok() {
++            continue; // Prepared::build checks the recorded plaintext digest.
++        }
++        let encrypted = inputs.join(crate::py::basename(name));
++        let size = file_size(&encrypted)?;
++        let expected = entry.get("sha256").and_then(pyjson::Value::as_str);
++        if entry.get("member") != member.get("path") || entry.get("crc32") != member.get("crc32")
++            || member.get("size").and_then(pyjson::Value::as_u64) != Some(size)
++            || expected.is_none()
++            || expected != Some(crate::sha256_of(encrypted.to_str().ok_or(Fail::Usage)?)?.as_str())
++        {
++            return Err(err!("{name}: does not match the verified fetch record"));
++        }
++        if let Some(space) = crate::apfs_tools::SPACE_CHECK.get() {
++            space(scratch, size.saturating_mul(2))?;
++        }
++        let folder = scratch.join(role);
++        fs::create_dir(&folder).map_err(|e| err!("{}: {e}", folder.display()))?;
++        let mut child = std::process::Command::new(helper).arg(&encrypted).arg(&folder)
++            .env_clear().env("SSL_CERT_DIR", "/system/etc/security/cacerts")
++            .stdin(std::process::Stdio::null()).spawn()
++            .map_err(|e| err!("{}: {e}", helper.display()))?;
++        let finished = loop {
++            match child.try_wait() {
++                Ok(Some(status)) => break Ok(status),
++                Ok(None) => {}
++                Err(e) => break Err(err!("{e}")),
++            }
++            if let Err(stop) = job::sleep(std::time::Duration::from_millis(150)) {
++                break Err(err!("{stop}"));
++            }
++        };
++        let status = match finished {
++            Ok(status) => status,
++            Err(e) => {
++                let _ = child.kill();
++                let _ = child.wait();
++                return Err(e);
++            }
++        };
++        if !status.success() {
++            return Err(err!("{name}: AEA decryption exited with {status}"));
++        }
++        let output = folder.join(plain_name);
++        file_size(&output)?;
++        crate::apfs::apfs_info(output.to_str().ok_or(Fail::Usage)?)?;
++        job::check().map_err(|stop| err!("{stop}"))?;
++        fs::rename(&output, &plain).map_err(|e| err!("{}: {e}", plain.display()))?;
++        ipsw::record_plain(inputs.to_str().ok_or(Fail::Usage)?, role, plain.to_str().ok_or(Fail::Usage)?)?;
++    }
++    Ok(())
++}
++
++fn file_size(path: &Path) -> Result<u64, Fail> {
++    let meta = fs::symlink_metadata(path).map_err(|e| err!("{}: {e}", path.display()))?;
++    if !meta.is_file() {
++        return Err(err!("{}: expected a regular file", path.display()));
++    }
++    Ok(meta.len())
++}
++
++fn collect_overlay(
++    root: &Path, dir: &Path, files: &mut Vec<(std::path::PathBuf, String, Option<String>)>, bytes: &mut u64,
++) -> Result<(), Fail> {
++    let entries = fs::read_dir(dir).map_err(|e| err!("{}: {e}", dir.display()))?;
++    for entry in entries {
++        job::check().map_err(|stop| err!("{stop}"))?;
++        let entry = entry.map_err(|e| err!("{}: {e}", dir.display()))?;
++        let path = entry.path();
++        let ty = entry.file_type().map_err(|e| err!("{}: {e}", path.display()))?;
++        if ty.is_dir() {
++            collect_overlay(root, &path, files, bytes)?;
++        } else {
++            let name = path.strip_prefix(root).ok().and_then(Path::to_str).ok_or(Fail::Usage)?.to_owned();
++            profile::check_set_path(&name, "overlay file")?;
++            *bytes = bytes.saturating_add(file_size(&path)?);
++            files.push((path, name, None));
++        }
++    }
++    Ok(())
++}
++
++fn copy_file(source: &Path, dest: &Path) -> Result<(), Fail> {
++    let failure = |e: std::io::Error| err!("{} -> {}: {e}", source.display(), dest.display());
++    let mut input = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
++        .open(source).map_err(failure)?;
++    if !input.metadata().map_err(failure)?.is_file() {
++        return Err(err!("{}: expected a regular file", source.display()));
++    }
++    fs::create_dir_all(dest.parent().ok_or(Fail::Usage)?).map_err(failure)?;
++    let mut output = File::create_new(dest).map_err(failure)?;
++    let mut buffer = vec![0; 1 << 20];
++    loop {
++        job::check().map_err(|stop| err!("{stop}"))?;
++        let n = input.read(&mut buffer).map_err(failure)?;
++        if n == 0 {
++            break;
++        }
++        output.write_all(&buffer[..n]).map_err(failure)?;
++        job::count(n as u64);
++    }
++    output.set_permissions(fs::Permissions::from_mode(0o644)).map_err(failure)
++}
+diff --git a/tools/oneios-tool/crates/oneios-serve/src/launchd.rs b/tools/oneios-tool/crates/oneios-serve/src/launchd.rs
+new file mode 100644
+--- /dev/null
++++ b/tools/oneios-tool/crates/oneios-serve/src/launchd.rs
+@@ -0,0 +1,109 @@
++//! Default launchd policy for the sealed guest layout.
++
++use plist::{Dictionary, Value};
++use std::collections::BTreeSet;
++use std::io::{Cursor, Read};
++use std::os::unix::fs::OpenOptionsExt;
++use std::path::Path;
++
++const POLICY: &str = include_str!("../../../../../userland/config/daemons.toml");
++const MAX_PLIST_BYTES: u64 = 64 << 20;
++
++pub(crate) struct Overrides {
++    pub bytes: Vec<u8>,
++    pub disabled: Vec<String>,
++    pub force_enabled: Vec<String>,
++}
++
++pub(crate) fn overrides(cache: &Path, existing: Option<&Path>, jetsam: &[String]) -> Result<Overrides, String> {
++    let policy = POLICY.parse::<toml::Table>().map_err(|e| format!("daemons.toml: {e}"))?;
++    let replace = policy.get("replace").and_then(toml::Value::as_table).ok_or("Missing [replace]")?;
++    let mut selected = BTreeSet::new();
++    if replace.get("default").and_then(toml::Value::as_bool).unwrap_or(true) {
++        let labels = replace.get("labels").and_then(toml::Value::as_table).ok_or("Missing [replace.labels]")?;
++        selected.extend(labels.keys().map(String::as_str));
++    }
++    if let Some(groups) = policy.get("group").and_then(toml::Value::as_table) {
++        for group in groups.values() {
++            if group.get("default").and_then(toml::Value::as_bool) != Some(true) {
++                continue;
++            }
++            let labels = group.get("labels").and_then(toml::Value::as_array).ok_or("Missing group labels")?;
++            for label in labels {
++                selected.insert(label.as_str().ok_or("Invalid daemon label")?);
++            }
++        }
++    }
++    let keep = policy.get("keep").and_then(|table| table.get("labels"))
++        .and_then(toml::Value::as_array).ok_or("Missing [keep] labels")?;
++    for label in keep {
++        let label = label.as_str().ok_or("Invalid [keep] label")?;
++        if selected.contains(label) {
++            return Err(format!("daemons.toml: {label} is both kept and disabled"));
++        }
++    }
++    if let Some(idle) = policy.get("idle").and_then(toml::Value::as_table) {
++        for label in idle.keys() {
++            if selected.contains(label.as_str()) {
++                return Err(format!("daemons.toml: {label} is both idled and disabled"));
++            }
++        }
++    }
++
++    let cache = read_dictionary(cache)?;
++    let present: BTreeSet<_> = cache.values()
++        .filter_map(Value::as_dictionary)
++        .flat_map(|group| group.values())
++        .filter_map(Value::as_dictionary)
++        .filter_map(|job| job.get("Label").and_then(Value::as_string))
++        .collect();
++    let mut disabled = match existing {
++        Some(path) => read_dictionary(path)?,
++        None => Dictionary::new(),
++    };
++    let applied: Vec<_> = selected.intersection(&present).map(|label| (*label).to_owned()).collect();
++    let mut forced = BTreeSet::new();
++    for path in jetsam {
++        oneios_common::job::check().map_err(|e| e.to_string())?;
++        let properties = read_dictionary(Path::new(path))?;
++        for version in properties.values().filter_map(Value::as_dictionary) {
++            for kind in ["Daemon", "XPCService"] {
++                let entries = version.get(kind).and_then(Value::as_dictionary)
++                    .and_then(|body| body.get("Override")).and_then(Value::as_dictionary);
++                if let Some(entries) = entries {
++                    forced.extend(applied.iter().filter(|label| {
++                        entries.get(label.as_str()).and_then(Value::as_dictionary)
++                            .and_then(|job| job.get("DisableAllowed")).and_then(Value::as_boolean) == Some(false)
++                    }).cloned());
++                }
++            }
++        }
++    }
++    for label in &applied {
++        disabled.insert(label.clone(), Value::Boolean(true));
++    }
++    disabled.sort_keys();
++    let mut bytes = Vec::new();
++    Value::Dictionary(disabled).to_writer_xml(&mut bytes).map_err(|e| e.to_string())?;
++    Ok(Overrides { bytes, disabled: applied, force_enabled: forced.into_iter().collect() })
++}
++
++fn read_dictionary(path: &Path) -> Result<Dictionary, String> {
++    let read_error = |e: std::io::Error| format!("{}: {e}", path.display());
++    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK)
++        .open(path).map_err(read_error)?;
++    let metadata = file.metadata().map_err(read_error)?;
++    if !metadata.is_file() || metadata.len() > MAX_PLIST_BYTES {
++        return Err(format!("{}: expected a regular plist file of at most 64 MiB", path.display()));
++    }
++    let mut bytes = Vec::new();
++    file.take(MAX_PLIST_BYTES + 1).read_to_end(&mut bytes).map_err(read_error)?;
++    if bytes.len() as u64 > MAX_PLIST_BYTES {
++        return Err(format!("{}: plist exceeds 64 MiB", path.display()));
++    }
++    match Value::from_reader(Cursor::new(bytes)) {
++        Ok(Value::Dictionary(value)) => Ok(value),
++        Ok(_) => Err(format!("{}: expected a plist dictionary", path.display())),
++        Err(e) => Err(format!("{}: {e}", path.display())),
++    }
++}
