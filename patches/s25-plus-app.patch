@@ -367,3 +367,24 @@ new file mode 100644
 +        }
 +    }
 +}
+
+diff --git a/switcher/assets/oneios_switch.sh b/switcher/assets/oneios_switch.sh
+index 272de3e..8088446 100644
+--- a/switcher/assets/oneios_switch.sh
++++ b/switcher/assets/oneios_switch.sh
+@@ -712,9 +712,14 @@ case "$MODE" in
+             *) die_inner "the switch is no longer starting (state '$ST'): xnuhost is not started" ;;
+         esac
+         AT="exec of /data/runtime/$R_XNUHOST"
++        gpu_mode=auto
++        case "$(getprop ro.product.device):$(getprop ro.product.model)" in
++            pa2q:SM-S936*) gpu_mode=2d ;;
++        esac
++        echo "oneios inner: GPU mode $gpu_mode"
+         echo "oneios inner: $(date '+%F %T') starting /data/runtime/$R_XNUHOST (pid $$)"
+         exec "/data/runtime/$R_XNUHOST" --session-abi $ABI --mode takeover \
+-            --runtime /data/runtime --image /data/image --data /data/data --session /data/session
++            --runtime /data/runtime --image /data/image --data /data/data --session /data/session --gpu "$gpu_mode"
+         echo "oneios inner: could not exec xnuhost"
+         exit 71
+         ;;
