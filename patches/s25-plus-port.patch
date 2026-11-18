@@ -1,0 +1,164 @@
+diff --git a/README.md b/README.md
+index c47ae90..21c3e22 100644
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,8 @@
+ # OneiOS
+ 
+ iOS 27 next to One UI on a rooted Samsung Galaxy S24 Ultra (SM-S928, SM8650) and, since 2026-11-13, the base Galaxy S25
+-(SM-S931B, SM8750, One UI 8.5; [docs/s25.md](docs/s25.md): changed for it, **not yet run on it**), switched to and back
++(SM-S931B, SM8750, One UI 8.5; [docs/s25.md](docs/s25.md): changed for it, **not yet run on it**), and the Galaxy S25+
++(SM-S936B; [docs/s25-plus.md](docs/s25-plus.md): same hosted design, QHD+ display, **not yet run on it**), switched to and back
+ the way [OneOS](https://github.com/fahadalijaved/OneOS) switches to another Android: nothing flashed,
+ the image lives in a folder, One UI's kernel keeps running.
+ 
+@@ -97,6 +98,7 @@ oneos/                the contract with the OneOS fork (akshaynexus/OneOS, branc
+ 
+ ## Credits
+ 
++[Galaxy S25+ port source](https://github.com/xaxaapple/s25ver) (xaxaapple): base S25/SM8750 work and research.
+ [OneOS](https://github.com/fahadalijaved/OneOS) (fahadalijaved) and
+ [OneLineage](https://github.com/WeWaffles/OneLineage) (WeWaffles): the container hot-switch.
+ [MysticGSI](https://github.com/MysticGSI/mysticgsi): the image build model.
+diff --git a/docs/building.md b/docs/building.md
+index ca3016c..e3a1829 100644
+--- a/docs/building.md
++++ b/docs/building.md
+@@ -320,6 +320,11 @@ artifact `oneios-s25-kit`; `gpu-patch-check.yml` checks that the metal2vulkan pa
+ to the pin and type-check. The host tests of xnuhost need `ASAN_OPTIONS=detect_leaks=0` where LeakSanitizer is
+ enforced (they keep their devices until exit); `make test` there also builds for Android, so it needs the NDK.
+ 
++For the Galaxy S25+, use the same probe with the `s25-plus` argument:
++`adb shell su -c 'sh /data/local/tmp/s25-probe.sh s25-plus'`. It writes
++`oneios-s25-plus-probe-<time>.tar.gz`; see [s25-plus.md](s25-plus.md) for expected differences and current
++validation status.
++
+ ## The image on GitHub Actions
+ 
+ `.github/workflows/build-image.yml` (manual run) does sections 1 to 3 on a runner: Apple's IPSW from Apple's CDN, the
+diff --git a/docs/hardware.md b/docs/hardware.md
+index 1d9552d..ce1224f 100644
+--- a/docs/hardware.md
++++ b/docs/hardware.md
+@@ -626,3 +626,10 @@ The second target; the facts, what changed for it and what is unknown are in [s2
+ (2 prime + 6 performance, no little cores, no SVE/SVE2/SME): `runtime/bridges/cpu/topology.c` never calls a Qualcomm
+ core E and lends the slowest cores to the guest as E vCPUs; the panel is 1080x2340 @120 Hz; Adreno 830; the haptics,
+ Bluetooth HAL kind and sysfs names are read by `tools/probe/s25-probe.sh`. The S24 Ultra sections above stay as they were.
++
++## Galaxy S25+ (SM-S936B, SM8750)
++
++The S25+ shares the S25's hosted CPU/GPU path and Oryon topology assumptions, with a 1440x3120 QHD+ panel. Its
++device-specific expectations and validation status are in [s25-plus.md](s25-plus.md). Run
++`tools/probe/s25-probe.sh s25-plus` on the phone to collect its own hardware facts; the base S25's probe results are
++not evidence for the S25+.
+diff --git a/docs/s25-plus.md b/docs/s25-plus.md
+new file mode 100644
+index 0000000..baf1c42
+--- /dev/null
++++ b/docs/s25-plus.md
+@@ -0,0 +1,45 @@
++# The Galaxy S25+ (SM-S936B) port
++
++The S25+ is a sibling target to the base S25 documented in [s25.md](s25.md). The OneiOS guest, XNU host, image,
++Adreno bridge and Oryon CPU plan are shared; this device's native panel is QHD+ (1440x3120 at up to 120 Hz),
++instead of the base S25's FHD+ (1080x2340). The device codename is `pa2q`. This port is **prepared but not yet
++run on an S25+**. Hardware facts below are specifications or expectations until the probe has been run on the phone.
++
++| Area | S25+ expectation | Port handling |
++|---|---|---|
++| Model | SM-S936B (regional variants use SM-S936*) | The [companion OneOS app](https://github.com/akshaynexus/OneOS/blob/oneios/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Profiles.kt) already has an S25+ profile matching `SM-S936*` + `pa2q` + `SM8750` (`S_PLUS_8750`). |
++| SoC / CPU | Snapdragon 8 Elite for Galaxy, SM8750; Oryon 2 prime + 6 performance cores | A companion OneOS probe identifies this S25+ as SM8750. The OneiOS probe still confirms the exact running handset's MIDR, capacities, frequency tables and core count. |
++| GPU | Adreno 830 | Same KGSL / drm2kgsl path as the base S25. Probe `chip_id`, `gpu_id`, import and submit on this handset. |
++| Panel | 1440x3120, QHD+, adaptive up to 120 Hz | The takeover display helper asks SurfaceFlinger for the panel's largest native mode, and xnuhost uses the reported mode. At scale 3 this gives 480x1040 guest points; scale 2 gives 720x1560. A frame is about 17.97 MiB. |
++| Firmware, kernel, root and HALs | Not measured on this handset | Use the probe output. Do not assume the base S25's exact firmware or HAL details. |
++
++The OneiOS manager previously hid its system card on this profile. Its companion source now includes
++`S_PLUS_8750` in `OneiosSystem.PROFILE_IDS`, so the card is offered for this phone and shows the existing experimental
++confirmation. Build and install that updated manager before expecting OneiOS to appear in the app.
++
++## What is shared and what is different
++
++No separate XNU board, kernel profile, guest image, or GPU implementation is required for the S25+. Both S25 models
++use the same hosted architecture and the S25+ stays within the existing 1440x3120 display limits. The SurfaceFlinger
++mode report is already used in takeover sessions, so it selects the S25+'s actual native dimensions and refresh rate;
++the configured or reported mode takes precedence over the base S25 fallback. If the display helper cannot read modes
++and the runtime cannot read a connected panel mode, the compiled fallback is still the base S25's 1080x2340. In that
++case, provide the native dimensions with `--width 1440 --height 3120` or resolve the display mode reporting first.
++
++The companion OneOS profile is based on an S25+ probe, but OneiOS-specific runtime support still needs a probe and
++session on the target handset. The OneiOS probe is the same read-only hardware survey as the S25 probe, with a
++separate archive name so results stay distinct. Run it with One UI active and root granted:
++
++```sh
++adb push tools/probe/s25-probe.sh /data/local/tmp/
++adb shell su -c 'sh /data/local/tmp/s25-probe.sh s25-plus'
++```
++
++It writes `/data/local/tmp/oneios-s25-plus-probe-<time>.tar.gz`. The CPU, GPU, display, touch, haptics, battery,
++sensor, Bluetooth, audio, camera, kernel and SELinux results settle the remaining device-specific assumptions.
++
++## Validation status
++
++The display-mode test already exercises a 1440x3120 panel report, matching the S25+'s expected native size. That is
++a host-side check of sizing and frame allocation, not evidence of a successful OneiOS phone session. No OneiOS S25+
++GPU submission, boot, or return-to-One-UI session has been observed yet.
+diff --git a/runtime/xnuhost/tests/test_display_mode.c b/runtime/xnuhost/tests/test_display_mode.c
+index 2260fe2..1cdfbbf 100644
+--- a/runtime/xnuhost/tests/test_display_mode.c
++++ b/runtime/xnuhost/tests/test_display_mode.c
+@@ -76,7 +76,8 @@ int main(void)
+   xh_log_open(NULL, XH_LOG_ERROR);
+   int failures = 0, r;
+ #define CASE(name, ...) do { r = run(dir, __VA_ARGS__); printf("%s: %s (%d)\n", name, r ? "FAILED" : "ok", r); failures += r != 0; } while (0)
+-  CASE("a session takes the helper's report", "takeover", 0, 0, 0, 1440, 3120, 120, 5.0);
++  // The Galaxy S25+ reports this QHD+ native mode; the complete helper path must preserve it.
++  CASE("S25+ QHD+ native mode comes from the helper", "takeover", 0, 0, 0, 1440, 3120, 120, 5.0);
+   report_w = 1260; report_h = 2800; report_hz = 90;                      // not the default: only the report can give this
+   CASE("another panel's report is the guest's mode", "takeover", 0, 0, 0, 1260, 2800, 90, 5.0);
+   report_w = 1440; report_h = 3120; report_hz = 120;
+diff --git a/tools/probe/s25-probe.sh b/tools/probe/s25-probe.sh
+index f96b8bb..5abbc35 100755
+--- a/tools/probe/s25-probe.sh
++++ b/tools/probe/s25-probe.sh
+@@ -1,22 +1,27 @@
+ #!/system/bin/sh
+-# s25-probe.sh: read-only facts of a Galaxy S25 (SM-S931B, pa1q, SM8750) that OneiOS needs and that cannot be
++# s25-probe.sh: read-only facts of a Galaxy S25-series phone that OneiOS needs and that cannot be
+ # looked up: CPU (Oryon) ids and capacities, kernel config (page size, VA bits, KGSL, udmabuf), the GPU,
+ # the panel and the touch screen, haptics, battery, light sensor, Bluetooth HAL kind, SELinux labels.
+ #
+ # Run it as root with One UI running (KernelSU): from adb,
+ #   adb push tools/probe/s25-probe.sh /data/local/tmp/ && adb shell su -c 'sh /data/local/tmp/s25-probe.sh'
++# For the S25+: adb shell su -c 'sh /data/local/tmp/s25-probe.sh s25-plus'
+ # or from a root terminal on the phone. It writes nothing but its own output folder and a .tar.gz of it, changes no
+ # setting, takes no serial number, IMEI, account or name (only the property keys listed below), and prints the path
+-# of the archive at the end. Send that archive (or the folder's files) back: docs/s25.md, "What the probe answers".
++# of the archive at the end. Send that archive (or the folder's files) back: docs/s25.md or docs/s25-plus.md.
+ #
+ # Optional: with the runtime's phone checks in /data/local/tmp/oneios/bin (the fork's stage) it also runs
+ # `gpuctl` for 20 s (the KGSL path: context, buffer import, submit), which shows whether drm2kgsl works on Adreno 830.
+ #
+ # Every step is time-limited; a step that fails writes its error to the file and the probe goes on.
+ 
+-OUT=/data/local/tmp/oneios-s25-probe
++TARGET=${1:-s25}
++case "$TARGET" in
++  s25|s25-plus) : ;;
++  *) echo "usage: $0 [s25|s25-plus]" >&2; exit 2 ;;
++esac
+ STAMP=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo now)
+-rm -rf "$OUT"
++OUT=/data/local/tmp/oneios-$TARGET-probe-$STAMP
+ mkdir -p "$OUT" || { echo "s25-probe: cannot make $OUT"; exit 1; }
+ [ "$(id -u)" = 0 ] || echo "s25-probe: not root: many files will be unreadable (run it through su)" >&2
+ 
+@@ -142,7 +147,7 @@ run mem sh -c 'head -5 /proc/meminfo; cat /proc/sys/vm/overcommit_memory /proc/s
+ run thermal sh -c 'for z in /sys/class/thermal/thermal_zone*; do echo "$(cat $z/type 2>&1): $(cat $z/temp 2>&1)"; done | head -40'
+ 
+ # ---- pack ----
+-ARCHIVE=/data/local/tmp/oneios-s25-probe-$STAMP.tar.gz
++ARCHIVE=/data/local/tmp/oneios-$TARGET-probe-$STAMP.tar.gz
+ tar -czf "$ARCHIVE" -C "$(dirname "$OUT")" "$(basename "$OUT")" 2>/dev/null || ARCHIVE="(tar failed: send the files of $OUT)"
+ [ -d /sdcard/Download ] && cp "$ARCHIVE" /sdcard/Download/ 2>/dev/null && echo "copy: /sdcard/Download/$(basename "$ARCHIVE")"
+-echo "s25-probe: done: $ARCHIVE ($(ls "$OUT" | wc -l) files in $OUT)"
++echo "$TARGET-probe: done: $ARCHIVE ($(ls "$OUT" | wc -l) files in $OUT)"
