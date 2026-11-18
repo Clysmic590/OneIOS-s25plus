@@ -84,22 +84,22 @@ jobs:
 
       - name: Build debug APK
         working-directory: source/app-android
-        run: ./gradlew --no-daemon :app:assembleFullDebug
+        run: ./gradlew --no-daemon -PoneiosDiagnostics=true :app:assembleFullDebug
 
       - name: Prepare APK and checksum
         working-directory: source
         run: |
           apk=app-android/app/build/outputs/apk/full/debug/app-full-debug.apk
           test -s "$apk"
-          cp "$apk" OneiOS-S25Plus-debug.apk
-          sha256sum OneiOS-S25Plus-debug.apk > OneiOS-S25Plus-debug.apk.sha256
+          cp "$apk" OneiOS-S25Plus-Diagnostics.apk
+          sha256sum OneiOS-S25Plus-Diagnostics.apk > OneiOS-S25Plus-Diagnostics.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-debug
+          name: OneiOS-S25Plus-Diagnostics
           path: |
-            source/OneiOS-S25Plus-debug.apk
-            source/OneiOS-S25Plus-debug.apk.sha256
+            source/OneiOS-S25Plus-Diagnostics.apk
+            source/OneiOS-S25Plus-Diagnostics.apk.sha256
           if-no-files-found: error
           retention-days: 30
