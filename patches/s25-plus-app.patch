@@ -369,10 +369,21 @@ new file mode 100644
 +}
 
 diff --git a/switcher/assets/oneios_switch.sh b/switcher/assets/oneios_switch.sh
-index 272de3e..8088446 100644
+index 272de3e..cb9ffa3 100644
 --- a/switcher/assets/oneios_switch.sh
 +++ b/switcher/assets/oneios_switch.sh
-@@ -712,9 +712,14 @@ case "$MODE" in
+@@ -653,7 +653,9 @@ case "$MODE" in
+         for d in runtime image control bin oneios_switch.sh oneios_return.sh; do
+             [ -e "/data/$d" ] || continue
+             at "making /data/$d read-only"
+-            "$BB" mount --bind "/data/$d" "/data/$d" && "$BB" mount -o remount,bind,ro "/data/$d" ||
++            # Give BusyBox both paths so it does not look up the file bind in /proc/mounts.
++            "$BB" mount --bind "/data/$d" "/data/$d" &&
++                "$BB" mount -o remount,bind,ro "/data/$d" "/data/$d" ||
+                 die_inner "could not make /data/$d read-only"
+         done
+         at "checking that /data/control is read-only"
+@@ -712,9 +714,14 @@ case "$MODE" in
              *) die_inner "the switch is no longer starting (state '$ST'): xnuhost is not started" ;;
          esac
          AT="exec of /data/runtime/$R_XNUHOST"
