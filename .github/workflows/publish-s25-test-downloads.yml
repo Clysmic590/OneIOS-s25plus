@@ -1,4 +1,4 @@
-name: Publish S25 test APK and ZIP as repository files
+name: Publish previous S25+ test APK
 
 on:
   push:
@@ -14,25 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify and publish both files
+      - name: Verify and publish the APK
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           zip="$RUNNER_TEMP/OneOS-S25-and-S25Plus.zip"
-          apk="$RUNNER_TEMP/OneOS-S25-and-S25Plus.apk"
-          branch=downloads/s25-test-36f12ea
+          apk="$RUNNER_TEMP/OneOS-S25Plus-Previous.apk"
+          branch=downloads/s25plus-previous-52d72f6
           curl --fail --silent --show-error --location --retry 2 \
             --header "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/14576087232/zip" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/14569838535/zip" \
             --output "$zip"
-          printf '%s  %s\n' c9d826f7df762d7b189afbac7362647e9c68389c94e93c7e1e049cd4c1602fa0 "$zip" | sha256sum --check
+          printf '%s  %s\n' f11833559ebdf112720761beb8931aa0fd9532061a55abfd0b21e76d0baf6a69 "$zip" | sha256sum --check
           unzip -p "$zip" OneiOS-S25Plus-Diagnostics.apk > "$apk"
           expected=$(unzip -p "$zip" OneiOS-S25Plus-Diagnostics.apk.sha256 | awk 'NR == 1 {print $1}')
           printf '%s  %s\n' "$expected" "$apk" | sha256sum --check
           git switch --orphan "$branch"
-          cp "$zip" "$apk" .
-          git add -- OneOS-S25-and-S25Plus.apk OneOS-S25-and-S25Plus.zip
+          cp "$apk" .
+          git add -- OneOS-S25Plus-Previous.apk
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'Publish the Galaxy S25 and S25+ OneOS test build'
+            commit -m 'Publish the previous Galaxy S25+ OneOS test APK'
           git push origin "HEAD:refs/heads/$branch"
