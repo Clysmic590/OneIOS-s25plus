@@ -369,7 +369,7 @@ new file mode 100644
 +}
 
 diff --git a/switcher/assets/oneios_switch.sh b/switcher/assets/oneios_switch.sh
-index 272de3e..cb9ffa3 100644
+index 272de3e..4cb3895 100644
 --- a/switcher/assets/oneios_switch.sh
 +++ b/switcher/assets/oneios_switch.sh
 @@ -653,7 +653,9 @@ case "$MODE" in
@@ -383,19 +383,45 @@ index 272de3e..cb9ffa3 100644
                  die_inner "could not make /data/$d read-only"
          done
          at "checking that /data/control is read-only"
-@@ -712,9 +714,14 @@ case "$MODE" in
+@@ -712,9 +714,20 @@ case "$MODE" in
              *) die_inner "the switch is no longer starting (state '$ST'): xnuhost is not started" ;;
          esac
          AT="exec of /data/runtime/$R_XNUHOST"
 +        gpu_mode=auto
++        set --
 +        case "$(getprop ro.product.device):$(getprop ro.product.model)" in
-+            pa2q:SM-S936*) gpu_mode=2d ;;
++            pa2q:SM-S936*)
++                gpu_mode=2d
++                # Leave room on the host for allocations that grow after first boot.
++                set -- --ram auto --set ram-percent=45 --set host-mem-log=5
++                echo "oneios inner: S25+ guest RAM capped at 45% of host RAM"
++                ;;
 +        esac
 +        echo "oneios inner: GPU mode $gpu_mode"
          echo "oneios inner: $(date '+%F %T') starting /data/runtime/$R_XNUHOST (pid $$)"
          exec "/data/runtime/$R_XNUHOST" --session-abi $ABI --mode takeover \
 -            --runtime /data/runtime --image /data/image --data /data/data --session /data/session
-+            --runtime /data/runtime --image /data/image --data /data/data --session /data/session --gpu "$gpu_mode"
++            --runtime /data/runtime --image /data/image --data /data/data --session /data/session --gpu "$gpu_mode" "$@"
          echo "oneios inner: could not exec xnuhost"
          exit 71
          ;;
+@@ -960,6 +973,19 @@ case "$MODE" in
+             esac
+             [ -e "$SESSION/return.request" ] && SCREEN="A return to One UI was asked for" && go "return asked ($(head -c 200 "$SESSION/return.request" 2>/dev/null))"
+             if ! { [ -n "$pid" ] && [ "$(readlink "$P/$pid/ns/mnt" 2>/dev/null)" = "$ns" ]; }; then
++                case "$pid" in
++                    ''|*[!0-9]*) ;;
++                    *)
++                        # Record only host events for this process in return.log, without delaying recovery.
++                        (
++                            timeout 2 dmesg 2>/dev/null
++                            timeout 2 logcat -b system -b crash -d -t 300 -s lmkd lowmemorykiller libc DEBUG 2>/dev/null
++                        ) | LC_ALL=C awk -v pid="$pid" '
++                            /xnuhost/ && $0 ~ ("(^|[^0-9])" pid "([^0-9]|$)") &&
++                            tolower($0) ~ /kill|signal|oom|crash/ { print "watcher: host exit evidence: " $0 }
++                        ' | tail -n 12 &
++                        ;;
++                esac
+                 SCREEN=$(why_ended)
+                 go "xnuhost $pid ended (last log lines: $(tail -n 3 "$SESSION/xnuhost.log" 2>/dev/null | tr '\n' '|' | cut -c1-300))"
+             fi
