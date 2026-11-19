@@ -864,3 +864,108 @@ new file mode 100644
 +        Err(e) => Err(format!("{}: {e}", path.display())),
 +    }
 +}
+
+diff --git a/runtime/xnuhost/src/gpu3d_kgsl.c b/runtime/xnuhost/src/gpu3d_kgsl.c
+index e31c462..98f488f 100644
+--- a/runtime/xnuhost/src/gpu3d_kgsl.c
++++ b/runtime/xnuhost/src/gpu3d_kgsl.c
+@@ -19,6 +19,7 @@
+ #include <sys/resource.h>
+ 
+ #include "virgl_context.h"
++#include "virgl_fence.h"
+ #include "virgl_resource.h"
+ #include "virgl_util.h"
+ #include "drm_hw.h"
+@@ -705,15 +706,18 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+   kgsl *k = calloc(1, sizeof *k);
+   if (!k) { snprintf(reason, sizeof reason, "no memory"); return NULL; }
+   virgl_log_set_handler(virgl_line, NULL, NULL);
+-  if (virgl_context_table_init() || virgl_resource_table_init(NULL)) { snprintf(reason, sizeof reason, "no memory for the renderer's tables"); free(k); return NULL; }
++  snprintf(reason, sizeof reason, "no memory for the renderer's tables");
++  if (virgl_context_table_init()) goto fail_context;
++  if (virgl_resource_table_init(NULL)) goto fail_resource;
++  // The sync-file timeline registers its fence fd here. Full virglrenderer initializes this table for its DRM context.
++  if (virgl_fence_table_init()) goto fail_fence;
+   int fd = open(KGSL_DEVICE_NODE, O_RDWR | O_CLOEXEC);
+   k->capset.context_type = VIRTGPU_DRM_CONTEXT_MSM;
+   int r = fd < 0 ? -errno : drm2kgsl_renderer_probe(fd, &k->capset);       // keeps its own descriptor for the VBO
+   if (fd >= 0) close(fd);
+   if (r) {
+     snprintf(reason, sizeof reason, "KGSL refused the probe (%d): no device info, or no virtual buffer object (KGSL_MEMFLAGS_VBO)", r);
+-    free(k);
+-    return NULL;
++    goto fail_probe;
+   }
+   k->ram_fd = ram_fd; k->ram_phys = ram_phys; k->ram_size = ram_size;
+   k->pool_host = pool_host; k->pool_size = pool_size;
+@@ -728,4 +732,14 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+       (unsigned long long)(k->capset.u.msm.va_size >> 30), k->capset.u.msm.priorities, (unsigned long long)(pool_size >> 20),
+       (unsigned long long)(chunk_bytes >> 20), chunk_runs);
+   return the;
++
++fail_probe:
++  virgl_fence_table_cleanup();
++fail_fence:
++  virgl_resource_table_cleanup();
++fail_resource:
++  virgl_context_table_cleanup();
++fail_context:
++  free(k);
++  return NULL;
+ }
+diff --git a/runtime/xnuhost/tests/test_drm2kgsl.c b/runtime/xnuhost/tests/test_drm2kgsl.c
+index 866eda4..95abc8f 100644
+--- a/runtime/xnuhost/tests/test_drm2kgsl.c
++++ b/runtime/xnuhost/tests/test_drm2kgsl.c
+@@ -31,6 +31,7 @@
+ #include <linux/udmabuf.h>
+ #define __user
+ #include "drm2kgsl/msm_kgsl.h"
++#include "virgl_fence.h"
+ 
+ // ---- the stand-in -----------------------------------------------------------------------------------------------------
+ #define VA_BASE 0x4000000000ull
+@@ -256,6 +257,20 @@ static int guest_buffer(context *c, uint32_t res, uint32_t blob, uint64_t iova,
+ }
+ 
+ // ---- the scenarios ----------------------------------------------------------------------------------------------------
++static int fence_table(void)
++{
++  if (!renderer()) { CHECK(false); return 1; }
++  int fd = __real_open("/dev/null", O_RDONLY | O_CLOEXEC);
++  CHECK(fd >= 0);
++  if (fd < 0) return 1;
++  CHECK(virgl_fence_set_fd(1, fd) == 0);
++  close(fd);
++  int exported = virgl_fence_get_fd(1);
++  CHECK(exported >= 0);
++  if (exported >= 0) close(exported);
++  return 0;
++}
++
+ // What the phone did with runtime 0.1.3: the VBO takes the whole range, and the first import finds no address.
+ static int whole_range(void)
+ {
+@@ -486,17 +501,18 @@ static bool scenario(const char *name, int (*run)(void))
+ int main(void)
+ {
+   int node = __real_open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
++  fake_udmabuf = node < 0;
++  bool ok = scenario("sync-file fence table is ready after renderer setup", fence_table);
+   if (node < 0) {
+     // The scenarios that read the guest's pages need the real one; the policy's run on the stand-in.
+     printf("drm2kgsl on a stand-in KGSL: no /dev/udmabuf here (%s): the memory scenarios skipped, the policy's on a stand-in udmabuf\n",
+            strerror(errno));
+-    fake_udmabuf = true;
+-    bool ok = scenario("queue priorities by the owner's class (patch 0008)", classes);
++    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
+     ok = scenario("a context whose surfaces the render server reads is not background", shown_surfaces) && ok;
+     return ok ? 0 : 1;
+   }
+   close(node);
+-  bool ok = scenario("a VBO over the whole address range (the phone, runtime 0.1.3)", whole_range);
++  ok = scenario("a VBO over the whole address range (the phone, runtime 0.1.3)", whole_range) && ok;
+   ok = scenario("a VBO that leaves room; buffers past udmabuf's limits", with_room) && ok;
+   ok = scenario("each import's IO coherence read back (patch 0007)", coherence) && ok;
+   ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
