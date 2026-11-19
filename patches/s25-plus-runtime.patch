@@ -26,6 +26,7 @@ index 9fe2a4a..403d282 100755
  # 2. Scripts (0755 when they have a #! line).
  if [ -d "$ROOT/runtime/scripts" ] && [ -n "$(ls -A "$ROOT/runtime/scripts")" ]; then
    mkdir -p "$STAGE/scripts"
+
 diff --git a/runtime/xnuhost/tools/gpuctl.c b/runtime/xnuhost/tools/gpuctl.c
 index 83682c9..0c1b185 100644
 --- a/runtime/xnuhost/tools/gpuctl.c
@@ -84,6 +85,7 @@ index 83682c9..0c1b185 100644
    r = get_param(ctx, 0x09 /* FAULTS */, &value);
    printf("submit: queue %u, 256 bytes of commands at 0x%llx run by the GPU, fence retired after %.2f ms; GPU faults %llu, async errors %u\n", queue,
           (unsigned long long)(iova + offset), (double)(end.tv_sec - start.tv_sec) * 1e3 + (double)(end.tv_nsec - start.tv_nsec) / 1e6,
+
 diff --git a/tools/oneios-tool/Cargo.lock b/tools/oneios-tool/Cargo.lock
 index 847c6cf..ab85230 100644
 --- a/tools/oneios-tool/Cargo.lock
@@ -101,8 +103,9 @@ index 847c6cf..ab85230 100644
  ]
  
  [[package]]
+
 diff --git a/tools/oneios-tool/crates/oneios-image/src/ipsw.rs b/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
-index 8601fe7..dd9b07c 100644
+index 8601fe7..b187901 100644
 --- a/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
 +++ b/tools/oneios-tool/crates/oneios-image/src/ipsw.rs
 @@ -161,7 +161,7 @@ pub fn cmd_check_ipsw(profile_path: &str, given: Option<&str>) -> Result<(), Fai
@@ -114,8 +117,31 @@ index 8601fe7..dd9b07c 100644
      use std::io::Read;
      let mut file = std::fs::File::open(path).map_err(|e| crash!("{}", py::os_error(&e, path)))?;
      let (mut a, mut b, mut block) = (Sha256::new(), Sha384::new(), vec![0u8; 1 << 22]);
+@@ -283,6 +283,21 @@ pub fn fetch(profile_path: &str, indir: &str, jobs: usize, only: Option<&str>, g
+     Ok(())
+ }
+ 
++/// A fetch writes the record after each member, so the record alone does not mean the download finished.
++pub fn inputs_complete(profile_path: &str, indir: &str) -> Result<bool, Fail> {
++    let profile = profile::load_profile(profile_path)?;
++    let record = load_record(&py::join(indir, "inputs.json"), &profile)?;
++    let members = record.get("members");
++    Ok(profile.members().iter().all(|member| {
++        let path = text(member, "path");
++        let out = py::join(indir, py::basename(path));
++        let Some(entry) = members.and_then(|entries| entries.get(text(member, "role"))) else { return false };
++        entry.get("member") == member.get("path") && entry.get("crc32") == member.get("crc32") &&
++            (decrypted_is_there(member, &record, indir, &out) ||
++                std::fs::symlink_metadata(out).is_ok_and(|m| m.is_file() && Some(m.len()) == member.get("size").and_then(Value::as_u64)))
++    }))
++}
++
+ /// An AEA whose decrypted image is recorded and still there is not downloaded again.
+ fn decrypted_is_there(m: &Value, record: &Value, indir: &str, out: &str) -> bool {
+     let plain = py::join(indir, &profile::input_name(m));
+
 diff --git a/tools/oneios-tool/crates/oneios-image/src/lib.rs b/tools/oneios-tool/crates/oneios-image/src/lib.rs
-index a8ac115..099859c 100644
+index a8ac115..b26ace3 100644
 --- a/tools/oneios-tool/crates/oneios-image/src/lib.rs
 +++ b/tools/oneios-tool/crates/oneios-image/src/lib.rs
 @@ -18,6 +18,7 @@
@@ -126,6 +152,15 @@ index a8ac115..099859c 100644
  #[cfg(test)]
  mod fixtures;
  mod hashes;
+@@ -29,6 +30,7 @@ mod seed;
+ mod aea;
+ mod archive;
+ mod ipsw;
++pub use ipsw::inputs_complete;
+ pub mod rangeserve;
+ pub mod remotezip;
+ pub mod transfer;
+
 diff --git a/tools/oneios-tool/crates/oneios-image/src/transfer.rs b/tools/oneios-tool/crates/oneios-image/src/transfer.rs
 index a1f4a27..89fd51c 100644
 --- a/tools/oneios-tool/crates/oneios-image/src/transfer.rs
@@ -143,6 +178,7 @@ index a1f4a27..89fd51c 100644
  }
  
  // ---------------------------------------------------------------- the state file
+
 diff --git a/tools/oneios-tool/crates/oneios-serve/Cargo.toml b/tools/oneios-tool/crates/oneios-serve/Cargo.toml
 index 3133090..45674df 100644
 --- a/tools/oneios-tool/crates/oneios-serve/Cargo.toml
@@ -156,20 +192,21 @@ index 3133090..45674df 100644
  # zip-ls's pattern
  regex = "1"
  oneios-common.workspace = true
+
 diff --git a/tools/oneios-tool/crates/oneios-serve/src/cmds.rs b/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
-index cf3ef13..3088bc3 100644
+index cf3ef13..e1ee392 100644
 --- a/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
 +++ b/tools/oneios-tool/crates/oneios-serve/src/cmds.rs
 @@ -46,6 +46,8 @@ pub static ALL: &[Spec] = &[
      Spec { name: "apfs-ls", heavy: false, pausable: false, steps: &[], run: apfs_ls },
      Spec { name: "apfs-copy", heavy: true, pausable: false, steps: &[("scan", "Reading the volume"), ("copy", "Copying the files"), ("place", "Putting the folder in place")], run: apfs_copy },
      Spec { name: "tweaks", heavy: true, pausable: false, steps: &[], run: tweaks },
-+    Spec { name: "make-image", heavy: true, pausable: false, steps: &[("decrypt", "Decrypting firmware volumes"), ("kernel", "Building the kernel collection"), ("seed", "Packing the Data seed"), ("copy", "Copying prepared image files"), ("verify", "Verifying image and manifest"), ("stage", "Recording verified files")], run: make_image },
++    Spec { name: "make-image", heavy: true, pausable: false, steps: &[("directory", "Reading the IPSW's directory"), ("download", "Downloading and checking the members"), ("decrypt", "Decrypting firmware volumes"), ("kernel", "Building the kernel collection"), ("seed", "Packing the Data seed"), ("copy", "Copying prepared image files"), ("verify", "Verifying image and manifest"), ("stage", "Recording verified files")], run: make_image },
 +    Spec { name: "launchd-overrides", heavy: true, pausable: false, steps: &[("policy", "Preparing launchd overrides")], run: launchd_overrides },
      Spec { name: "prelink", heavy: true, pausable: false, steps: &oneios_prelink::build::STEPS, run: prelink },
      Spec { name: "stubs-check", heavy: true, pausable: false, steps: &[("check", "Checking the stubs")], run: stubs_check },
      Spec { name: "package-check", heavy: true, pausable: false, steps: &[("check", "Checking the runtime's files")], run: package_check },
-@@ -782,6 +784,190 @@ fn tweaks(_: &Rq) -> Result<Done, Fail> {
+@@ -782,6 +784,210 @@ fn tweaks(_: &Rq) -> Result<Done, Fail> {
      ))
  }
  
@@ -198,6 +235,20 @@ index cf3ef13..3088bc3 100644
 +    if std::fs::read_dir(out_dir).map_err(|e| io(&out, e))?.next().is_some() {
 +        return Err(Fail::refused("exists", "image.new is not empty; start a new staging operation"));
 +    }
++    let prepared_kernel = prepared.join("kernel.kc").is_file();
++    let can_prelink = stage.join("runtime/kernel/xnu.macho").is_file() && stage.join("runtime/lib/prelink").is_dir();
++    let prepared_seed = prepared.join("data.seed").is_file();
++    let can_pack_seed = prepared.join("tweaked-data").is_dir() &&
++        prepared.join("data.meta.json").is_file() && prepared.join("owners.tsv").is_file();
++    let mut missing = Vec::new();
++    if !prepared_kernel && !can_prelink { missing.push("a kernel collection (kernel.kc)"); }
++    if !prepared_seed && !can_pack_seed { missing.push("a Data seed (data.seed)"); }
++    if !missing.is_empty() {
++        return Err(Fail::refused("prepared-inputs", format!(
++            "Make iOS image needs {} prepared on a PC in make/prepared. To install a finished image, use iOS image set → I have the file.",
++            missing.join(" and ")
++        )));
++    }
 +    let helper = stage.join("runtime/bin/oneios-aea");
 +    if helper.exists() {
 +        let expected = std::fs::read_to_string(stage.join("runtime.sha256")).map_err(|e| io("runtime.sha256", e))?;
@@ -206,6 +257,12 @@ index cf3ef13..3088bc3 100644
 +        if want != Some(oneios_image::sha256_of(&helper.to_string_lossy()).map_err(image_fail)?.as_str()) {
 +            return Err(Fail::refused("mismatch", "The AEA helper does not match the staged runtime"));
 +        }
++    }
++    if !oneios_image::inputs_complete(&profile.to_string_lossy(), &indir).map_err(image_fail)? {
++        job::step("directory");
++        oneios_image::fetch(&profile.to_string_lossy(), &indir, 4, None, None, true).map_err(image_fail)?;
++    }
++    if helper.exists() {
 +        let scratch = out_dir.join("decrypt");
 +        std::fs::create_dir(&scratch).map_err(|e| io("decrypt work folder", e))?;
 +        let guard = job::temp(scratch);
@@ -213,7 +270,7 @@ index cf3ef13..3088bc3 100644
 +        assemble::decrypt_members(&profile.to_string_lossy(), Path::new(&indir), &helper, guard.path())
 +            .map_err(image_fail)?;
 +    }
-+    let kernel_work = if !prepared.join("kernel.kc").exists() && stage.join("runtime/lib/prelink").is_dir() {
++    let kernel_work = if !prepared_kernel {
 +        let scratch = out_dir.join("prelink");
 +        std::fs::create_dir(&scratch).map_err(|e| io("prelink work folder", e))?;
 +        let guard = job::temp(scratch);
@@ -222,7 +279,7 @@ index cf3ef13..3088bc3 100644
 +    } else {
 +        None
 +    };
-+    let seed_work = if !prepared.join("data.seed").exists() && prepared.join("tweaked-data").is_dir() {
++    let seed_work = if !prepared_seed {
 +        let scratch = out_dir.join("seed");
 +        std::fs::create_dir(&scratch).map_err(|e| io("seed work folder", e))?;
 +        let guard = job::temp(scratch);
@@ -360,6 +417,7 @@ index cf3ef13..3088bc3 100644
  fn prelink(rq: &Rq) -> Result<Done, Fail> {
      use oneios_prelink::build::{self, Refused};
      let args = build::Args {
+
 diff --git a/tools/oneios-tool/crates/oneios-serve/src/lib.rs b/tools/oneios-tool/crates/oneios-serve/src/lib.rs
 index 43e94db..dd9a21a 100644
 --- a/tools/oneios-tool/crates/oneios-serve/src/lib.rs
@@ -372,6 +430,7 @@ index 43e94db..dd9a21a 100644
  pub mod proto;
  
  use capture::Capture;
+
 diff --git a/runtime/aea/build.sh b/runtime/aea/build.sh
 new file mode 100644
 --- /dev/null
@@ -394,6 +453,7 @@ new file mode 100644
 +cd "$work"
 +CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$cc" go build -mod=readonly -buildmode=pie -trimpath -ldflags='-s -w' -o "$out" ./oneios-aea
 +cp LICENSE "$(dirname "$out")/../LICENSE-blacktop-ipsw"
+
 diff --git a/runtime/aea/main.go b/runtime/aea/main.go
 new file mode 100644
 --- /dev/null
@@ -469,6 +529,7 @@ new file mode 100644
 +		os.Exit(1)
 +	}
 +}
+
 diff --git a/tools/oneios-tool/crates/oneios-image/src/assemble.rs b/tools/oneios-tool/crates/oneios-image/src/assemble.rs
 new file mode 100644
 --- /dev/null
@@ -750,6 +811,7 @@ new file mode 100644
 +    }
 +    output.set_permissions(fs::Permissions::from_mode(0o644)).map_err(failure)
 +}
+
 diff --git a/tools/oneios-tool/crates/oneios-serve/src/launchd.rs b/tools/oneios-tool/crates/oneios-serve/src/launchd.rs
 new file mode 100644
 --- /dev/null
@@ -914,6 +976,7 @@ index e31c462..98f488f 100644
 +  free(k);
 +  return NULL;
  }
+
 diff --git a/runtime/xnuhost/tests/test_drm2kgsl.c b/runtime/xnuhost/tests/test_drm2kgsl.c
 index 866eda4..95abc8f 100644
 --- a/runtime/xnuhost/tests/test_drm2kgsl.c
@@ -1007,3 +1070,4 @@ index 8bfdb93..484b474 100644
    if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
    if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
        !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {
+
