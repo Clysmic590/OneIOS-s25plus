@@ -969,3 +969,41 @@ index 866eda4..95abc8f 100644
    ok = scenario("a VBO that leaves room; buffers past udmabuf's limits", with_room) && ok;
    ok = scenario("each import's IO coherence read back (patch 0007)", coherence) && ok;
    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
+
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 8bfdb93..484b474 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -8,6 +8,11 @@
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#ifdef __ANDROID__
++#include <sys/system_properties.h>
++
++static bool has_switch(const char *args, const char *name);
++#endif
+ 
+ void xh_config_defaults(xh_config *c)
+ {
+@@ -315,6 +320,20 @@ int xh_config_finish(xh_config *c)
+     strcpy(c->boot_args, "debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 "
+            "sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 "
+            "sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=1 droidvm-gpu-metal=1");
++#ifdef __ANDROID__
++  char device[PROP_VALUE_MAX], model[PROP_VALUE_MAX];
++  static const char buttons[] = " oneios-hid-buttons-builtin=1";
++  if (!strcmp(c->mode, "takeover") &&
++      __system_property_get("ro.product.device", device) > 0 && !strcmp(device, "pa2q") &&
++      __system_property_get("ro.product.model", model) > 0 && !strncmp(model, "SM-S936", 7) &&
++      !has_switch(c->boot_args, "oneios-hid-buttons-builtin")) {
++    size_t used = strlen(c->boot_args);
++    if (sizeof buttons <= sizeof c->boot_args - used) {
++      memcpy(c->boot_args + used, buttons, sizeof buttons);
++      fprintf(stderr, "xnuhost: S25+ built-in HID button routing enabled\n");
++    }
++  }
++#endif
+   if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
+   if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
+       !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {

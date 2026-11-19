@@ -47,13 +47,13 @@ jobs:
         working-directory: runtime-source
         env:
           ONEIOS_BUILD_AEA: '1'
-        run: bash runtime/package.sh 0.1.13-s25plus
+        run: bash runtime/package.sh 0.1.14-s25plus
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
           name: OneiOS-S25Plus-Runtime
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.13-s25plus-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.13-s25plus-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.14-s25plus-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.14-s25plus-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30
