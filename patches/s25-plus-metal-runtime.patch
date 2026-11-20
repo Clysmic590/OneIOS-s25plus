@@ -1034,7 +1034,7 @@ index 866eda4..95abc8f 100644
    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
 
 diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
-index 8bfdb93..0be7a37 100644
+index 8bfdb93..384c35b 100644
 --- a/runtime/xnuhost/src/config.c
 +++ b/runtime/xnuhost/src/config.c
 @@ -8,6 +8,11 @@
@@ -1049,6 +1049,15 @@ index 8bfdb93..0be7a37 100644
  
  void xh_config_defaults(xh_config *c)
  {
+@@ -291,7 +296,7 @@ int xh_config_finish(xh_config *c)
+   if (c->setway_skip < 0) c->setway_skip = from_image.setway_skip < 0 ? 1 : from_image.setway_skip;
+   if (c->perf_log < 0) c->perf_log = from_image.perf_log;
+   if (c->spin_host < 0) c->spin_host = from_image.spin_host;
+-  if (!*c->gpu_level) strcpy(c->gpu_level, *from_image.gpu_level ? from_image.gpu_level : "deadline");
++  if (!*c->gpu_level) strcpy(c->gpu_level, from_image.gpu_level);
+   if (c->gpu_priority < 0) c->gpu_priority = from_image.gpu_priority < 0 ? 1 : from_image.gpu_priority;
+   if (c->spin_task < 0) c->spin_task = from_image.spin_task;
+   if (c->map_defer < 0) c->map_defer = from_image.map_defer;
 @@ -315,6 +320,20 @@ int xh_config_finish(xh_config *c)
      strcpy(c->boot_args, "debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 "
             "sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 "
@@ -1108,7 +1117,7 @@ index 77d00c6..12755a9 100644
        if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
      } else if (v->type == EV_ABS_ && s->touch) {
 diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
-index 2be908f..f34f442 100644
+index 2be908f..1d2b52f 100644
 --- a/runtime/xnuhost/src/main.c
 +++ b/runtime/xnuhost/src/main.c
 @@ -163,6 +163,7 @@ static xl_blob sidecar(const char *suffix, size_t limit)
@@ -1119,7 +1128,7 @@ index 2be908f..f34f442 100644
  void android_set_application_target_sdk_version(int target);
  #endif
  #include <sys/prctl.h>
-@@ -521,13 +522,45 @@ static int boot(void)
+@@ -521,13 +522,56 @@ static int boot(void)
         kernel.cpusubtype == 2 ? "arm64e" : "arm64", (unsigned long long)kernel.base, kernel.nseg, kernel.nentries);
    if (kernel.cpusubtype == 2 && !(g_info.features & XH_FEATURE_PAC)) { LOGE("an arm64e kernel needs pointer authentication with keys shared across fork; this host has none"); return -1; }
  
@@ -1151,9 +1160,20 @@ index 2be908f..f34f442 100644
 +      metal_cdhashes = NULL;
 +    } else {
 +      LOGI("gpu: 24A446 Metal runtime selected on Galaxy S25+");
++      // The phone's 120 Hz session spent long stretches at the top KGSL level.
++      if (!config.hz) config.hz = 60;
++      if (!*config.gpu_level) strcpy(config.gpu_level, "governor");
++      LOGI("gpu: S25+ Metal profile: guest refresh %u Hz, KGSL level policy %s", config.hz, config.gpu_level);
 +    }
 +  }
 +#endif
++
++  if (xh_display_init(&config, &fb_width, &fb_height, &fb_hz)) return -1;
++  // A refresh rate or scale explicitly given in the kernel command line stays.
++  if (xh_display_boot_args(config.boot_args, sizeof config.boot_args, config.scale, fb_hz, config.display_format)) {
++    LOGE("no room in the boot arguments for the display's switches");
++    return -1;
++  }
 +
    // RAM: the kernel's window, then the GPU's pool (the memory of the renderer's that the guest maps: each 3D
    // context's response buffer), then the video encoder's media pool (its V4L2 OUTPUT/CAPTURE buffers), then the boot
@@ -1166,7 +1186,7 @@ index 2be908f..f34f442 100644
    uint64_t media_bytes = strcmp(config.encoder, "off") ? MEDIA_POOL_BYTES : 0;
    uint64_t window = config.ram_bytes - fb_bytes - pool_bytes - media_bytes;
    // 2 MiB host pages for the RAM where this kernel allows them (fix-ram-hugepages; ramfix.c xh_huge_choose): shmem THP
-@@ -557,7 +590,6 @@ static int boot(void)
+@@ -557,7 +601,6 @@ static int boot(void)
    xh_gic_notify = gic_line;
    xh_gic_map();
    xh_uart_init(XL_BOARD_UART);
@@ -1174,7 +1194,7 @@ index 2be908f..f34f442 100644
    for (unsigned i = 0; i < config.ndisk; i++) {
      xh_blk *disk = xh_blk_open(&config.disk[i], &error);
      if (!disk) { LOGE("disk %s: %s (%s)", config.disk[i].path, error, strerror(errno)); return -1; }
-@@ -816,10 +848,17 @@ static int boot(void)
+@@ -816,10 +859,17 @@ static int boot(void)
    machine.display_height = fb_height;
    machine.display_scale = config.scale;
    machine.display_hz = fb_hz;
@@ -1193,7 +1213,7 @@ index 2be908f..f34f442 100644
    if (config.text_fixups_length) {
      machine.text_fixups = config.text_fixups;
      machine.text_fixups_length = config.text_fixups_length;
-@@ -831,11 +870,19 @@ static int boot(void)
+@@ -831,11 +881,19 @@ static int boot(void)
    machine.user_va_limit = xh_tasks_va_limit();
    machine.host_page_size = g_info.host_page_size;
    if (getentropy(machine.random_seed, sizeof machine.random_seed)) { LOGE("no entropy for the kernel's seed"); return -1; }
@@ -1216,6 +1236,16 @@ index 2be908f..f34f442 100644
      if (!trust.data) { LOGE("trust caches of %s: %s", config.image, error); return -1; }
      LOGI("trust caches: %u modules from the image set, %zu bytes", (unsigned)trust.data[0], trust.size);
    }
+@@ -1232,9 +1290,6 @@ int main(int argc, char **argv)
+     snprintf(pid, sizeof pid, "%d\n", getpid());
+     session_file("xnuhost.pid", pid);
+   }
+-  if (xh_display_init(&config, &fb_width, &fb_height, &fb_hz)) return EXIT_SETUP;
+-  // The display driver's scale and refresh rate go on the kernel's command line (a value given there stays).
+-  if (xh_display_boot_args(config.boot_args, sizeof config.boot_args, config.scale, fb_hz, config.display_format)) { LOGE("no room in the boot arguments for the display's switches"); return EXIT_SETUP; }
+   // 24A446's bluetoothd with the virtual machine hidden takes its chip path and dies (SIGSEGV at 0x350) in a loop that
+   // launchd then throttles for 1200 s (phone and PC, 2026-11-14; docs/hardware.md 4): said, not changed. [I] Its chip
+   // factory finds no chip for transport-encoding 1 outside a VM (only transport 9 or a product of its table gives one),
 diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
 index 0a468d6..6939922 100644
 --- a/runtime/xnuhost/src/xnuhost.h
