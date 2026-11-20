@@ -1034,7 +1034,7 @@ index 866eda4..95abc8f 100644
    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
 
 diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
-index 8bfdb93..484b474 100644
+index 8bfdb93..0be7a37 100644
 --- a/runtime/xnuhost/src/config.c
 +++ b/runtime/xnuhost/src/config.c
 @@ -8,6 +8,11 @@
@@ -1070,4 +1070,100 @@ index 8bfdb93..484b474 100644
    if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
    if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
        !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {
-
+@@ -652,3 +671,18 @@ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned
+   }
+   return length;
+ }
++
++unsigned xh_backlight_fixup(const char *build, const char *boot_args, char *list, unsigned length, unsigned size)
++{
++  // CoreBrightness -[BrightnessSystemInternal init] at 0x22aa5fe78 in 24A446:
++  // mov w8, #3 -> mov w8, #1. The virtual device selects local BLControl, as the Metal plug-in does.
++  static const char fixup[] = "dyld_shared_cache_arm64e.38,265fe78,68008052,28008052";
++  static const char disabled[] = "oneios-bl-mode=0";
++  if (!build || strcmp(build, "24A446") || length > size || sizeof fixup > size - length) return length;
++  for (const char *p = boot_args; (p = strstr(p, disabled)); p++) {
++    char end = p[sizeof disabled - 1];
++    if ((p == boot_args || p[-1] == ' ') && (!end || end == ' ')) return length;
++  }
++  memcpy(list + length, fixup, sizeof fixup);
++  return length + sizeof fixup;
++}
+diff --git a/runtime/xnuhost/src/input.c b/runtime/xnuhost/src/input.c
+index 77d00c6..12755a9 100644
+--- a/runtime/xnuhost/src/input.c
++++ b/runtime/xnuhost/src/input.c
+@@ -193,6 +193,13 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+     } else if (v->type == EV_KEY_) {
+       // The side keys, and the two the guest also takes from a host that has them (OneiOSSideKeys.inc): Home, the ringer.
+       bool side = v->code == KEY_VOLUMEDOWN_ || v->code == KEY_VOLUMEUP_ || v->code == KEY_POWER_ || v->code == KEY_MUTE_ || v->code == KEY_HOMEPAGE_;
++      if (v->value == 1 && v->code >= KEY_VOLUMEDOWN_ && v->code <= KEY_POWER_) {
++        unsigned key = 1u << (v->code - KEY_VOLUMEDOWN_);
++        if (!(s->logged_side_keys & key)) {
++          s->logged_side_keys |= key;
++          LOGI("input: %s: first side-button press (Linux key %u), forwarding to virtio-input", s->name, v->code);
++        }
++      }
+       if (side || (s->touch && v->code == BTN_TOUCH_)) send_event(s, EV_KEY_, v->code, v->value);
+       if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
+     } else if (v->type == EV_ABS_ && s->touch) {
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 2be908f..a82e7d9 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -816,10 +816,16 @@ static int boot(void)
+   machine.display_height = fb_height;
+   machine.display_scale = config.scale;
+   machine.display_hz = fb_hz;
+-  // Signed text the kernel changes at page-in (/chosen text-fixups): the configured ones, and what the UI scale needs.
++  // The kernel checks the original bytes before applying the configured and build-specific text fixups.
+   if (config.scale_fixup)
+     config.text_fixups_length = xh_scale_fixups(have_image_set ? image_set.build : NULL, config.scale, config.text_fixups,
+                                                 config.text_fixups_length, sizeof config.text_fixups);
++  if (brightness && !gpu3d && have_image_set) {
++    unsigned before = config.text_fixups_length;
++    config.text_fixups_length = xh_backlight_fixup(image_set.build, config.boot_args, config.text_fixups,
++                                                  before, sizeof config.text_fixups);
++    if (config.text_fixups_length != before) LOGI("brightness: queued the 24A446 CoreBrightness fixup for 2D");
++  }
+   if (config.text_fixups_length) {
+     machine.text_fixups = config.text_fixups;
+     machine.text_fixups_length = config.text_fixups_length;
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index 0a468d6..6939922 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -230,6 +230,8 @@ int xh_boot_args_bt_transport(const char *args);
+ // Appends the text fixups a UI scale needs on this build's dyld shared cache to a NUL-separated list
+ // (/chosen text-fixups). Returns the list's new length; unknown builds and a scale of 2 add nothing.
+ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned length, unsigned size);
++// Appends the CoreBrightness fixup for 2D sessions with a panel bridge, unless oneios-bl-mode=0.
++unsigned xh_backlight_fixup(const char *build, const char *boot_args, char *list, unsigned length, unsigned size);
+ 
+ // ---- registers of a trapped kernel context (arch) -----------------------------------------------
+ typedef struct { uint64_t x[31], sp, pc, pstate; } xh_regs;
+@@ -663,6 +665,7 @@ typedef struct xh_input_source {
+   int        fd;
+   int      (*read_state)(struct xh_input_source *s, xh_input_state *state);   // 0 when read
+   unsigned   slot, sent_keys, began, frame_began, drops;
++  unsigned   logged_side_keys;                   // first physical down event of each kind on this input source
+   int32_t    sent_id[XH_INPUT_SLOTS];             // the tracking id the guest was last sent per slot
+   xh_input_timing timing;
+ } xh_input_source;
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index fe58c50..90eae4c 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1980,6 +1980,12 @@ static void test_config(const char *dir)
+   CHECK(strstr(c.text_fixups + 17 + 54, ",40b17bc,280080520895889a,680080521f2003d5") && c.text_fixups[length - 1] == 0);
+   CHECK(xh_scale_fixups("24A446", 2, c.text_fixups, 17, sizeof c.text_fixups) == 17);                // @2x is QuartzCore's own answer
+   CHECK(xh_scale_fixups("24A447", 3, c.text_fixups, 17, sizeof c.text_fixups) == 17 && xh_scale_fixups(NULL, 3, c.text_fixups, 17, sizeof c.text_fixups) == 17);
++  static const char bl_fixup[] = "dyld_shared_cache_arm64e.38,265fe78,68008052,28008052";
++  CHECK(xh_backlight_fixup("24A446", "", c.text_fixups, length, sizeof c.text_fixups) == length + sizeof bl_fixup);
++  CHECK(!strcmp(c.text_fixups + length, bl_fixup));
++  CHECK(xh_backlight_fixup("24A446", "-v oneios-bl-mode=0 -x", c.text_fixups, length, sizeof c.text_fixups) == length);
++  CHECK(xh_backlight_fixup("24A447", "", c.text_fixups, length, sizeof c.text_fixups) == length);
++  CHECK(xh_backlight_fixup("24A446", "", c.text_fixups, length, length + sizeof bl_fixup - 1) == length);
+   char *badscale[] = { "xnuhost", "--image", image, "--scale", "4" };
+   xh_config_defaults(&c);
+   CHECK(xh_config_args(&c, 5, badscale) == -1);
