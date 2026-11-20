@@ -928,7 +928,7 @@ new file mode 100644
 +}
 
 diff --git a/runtime/xnuhost/src/gpu3d_kgsl.c b/runtime/xnuhost/src/gpu3d_kgsl.c
-index e31c462..c5b5572 100644
+index e31c462..69b41bf 100644
 --- a/runtime/xnuhost/src/gpu3d_kgsl.c
 +++ b/runtime/xnuhost/src/gpu3d_kgsl.c
 @@ -19,6 +19,7 @@
@@ -939,6 +939,24 @@ index e31c462..c5b5572 100644
  #include "virgl_resource.h"
  #include "virgl_util.h"
  #include "drm_hw.h"
+@@ -29,7 +30,7 @@
+ typedef struct {
+   xh_gpu3d base;
+   struct virgl_renderer_capset_drm capset;
+-  int ram_fd;
++  int ram_fd, udmabuf_fd;
+   uint64_t ram_phys, ram_size;
+   uint8_t *pool_host;
+   uint64_t pool_size;
+@@ -467,7 +468,7 @@ static int create_blob_now(xh_gpu3d *b, uint32_t id, uint32_t res, uint32_t blob
+   int nchunks = 0;
+   if (nentries) {
+     uint64_t u0 = now_us();
+-    nchunks = xh_gpu3d_udmabufs(k->ram_fd, k->ram_phys, k->ram_size, entries, nentries, &chunks);
++    nchunks = xh_gpu3d_udmabufs_on(k->udmabuf_fd, k->ram_fd, k->ram_phys, k->ram_size, entries, nentries, &chunks);
+     uint64_t u1 = now_us();
+     pthread_mutex_lock(&st.lock);
+     st.udma_sum += u1 - u0;
 @@ -480,10 +481,16 @@ static int create_blob_now(xh_gpu3d *b, uint32_t id, uint32_t res, uint32_t blob
      if (nchunks > 1) say(2, "gpu: resource %u: %llu bytes in %u segments as %d udmabufs", res, (unsigned long long)size, nentries, nchunks);
    }
@@ -980,7 +998,7 @@ index e31c462..c5b5572 100644
      int fds[n];
      uint64_t sizes[n];
      bool ok = true;
-@@ -705,15 +717,18 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+@@ -705,17 +717,21 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
    kgsl *k = calloc(1, sizeof *k);
    if (!k) { snprintf(reason, sizeof reason, "no memory"); return NULL; }
    virgl_log_set_handler(virgl_line, NULL, NULL);
@@ -1001,8 +1019,11 @@ index e31c462..c5b5572 100644
 +    goto fail_probe;
    }
    k->ram_fd = ram_fd; k->ram_phys = ram_phys; k->ram_size = ram_size;
++  k->udmabuf_fd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);  // reused until this renderer's process exits
    k->pool_host = pool_host; k->pool_size = pool_size;
-@@ -728,4 +743,14 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+   k->base = (xh_gpu3d){ .opaque = k, .capset_count = capset_count, .capset_info = capset_info, .capset = capset, .ctx_create = ctx_create,
+                         .ctx_destroy = ctx_destroy, .submit = submit, .submit_fence = submit_fence, .create_blob = create_blob,
+@@ -728,4 +744,14 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
        (unsigned long long)(k->capset.u.msm.va_size >> 30), k->capset.u.msm.priorities, (unsigned long long)(pool_size >> 20),
        (unsigned long long)(chunk_bytes >> 20), chunk_runs);
    return the;
@@ -1456,10 +1477,20 @@ index e95a0aa..a3e07f5 100644
      if (blob.data) printf("real set: trust cache sidecar, %u modules, %zu bytes\n", (unsigned)blob.data[0], blob.size);
      else printf("real set: trust caches: %s\n", error);
 diff --git a/runtime/xnuhost/src/gpu3d.c b/runtime/xnuhost/src/gpu3d.c
-index fce1902..d85381a 100644
+index fce1902..45bf29a 100644
 --- a/runtime/xnuhost/src/gpu3d.c
 +++ b/runtime/xnuhost/src/gpu3d.c
-@@ -62,7 +62,9 @@ int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh
+@@ -51,7 +51,8 @@ void xh_gpu3d_chunks_free(xh_gpu_chunk *chunks, unsigned n)
+   free(chunks);
+ }
+ 
+-int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_gpu_entry *entries, unsigned n, xh_gpu_chunk **out)
++int xh_gpu3d_udmabufs_on(int dev_fd, int ram_fd, uint64_t ram_phys, uint64_t ram_size,
++                        const xh_gpu_entry *entries, unsigned n, xh_gpu_chunk **out)
+ {
+   uint64_t max_bytes;
+   unsigned max_runs;
+@@ -62,13 +63,15 @@ int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh
      uint64_t addr = entries[i].addr, length = entries[i].length;
      if (!length || ((addr | length) & 0xfff) || addr < ram_phys || addr - ram_phys > ram_size || length > ram_size - (addr - ram_phys)) { errno = EINVAL; return -1; }
    }
@@ -1470,3 +1501,88 @@ index fce1902..d85381a 100644
    xh_gpu_chunk *chunks = NULL;
    unsigned nchunks = 0, room = 0, count = 0;
    uint64_t bytes = 0;
+-  int dev = -1, error = ENOMEM;
++  int dev = dev_fd, error = ENOMEM;
+   if (!list) goto fail;
+-  if ((dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC)) < 0) { error = errno; goto fail; }
++  if (dev < 0 && (dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC)) < 0) { error = errno; goto fail; }
+   for (unsigned i = 0; i <= n; i++) {
+     uint64_t offset = i < n ? entries[i].addr - ram_phys : 0, left = i < n ? entries[i].length : 0;
+     do {
+@@ -96,18 +99,23 @@ int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh
+       bytes += take; offset += take; left -= take;
+     } while (left || i == n);
+   }
+-  close(dev);
++  if (dev_fd < 0) close(dev);
+   free(list);
+   *out = chunks;
+   return (int)nchunks;
+ fail:
+-  if (dev >= 0) close(dev);
++  if (dev_fd < 0 && dev >= 0) close(dev);
+   free(list);
+   xh_gpu3d_chunks_free(chunks, nchunks);
+   errno = error;
+   return -1;
+ }
+ 
++int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_gpu_entry *entries, unsigned n, xh_gpu_chunk **out)
++{
++  return xh_gpu3d_udmabufs_on(-1, ram_fd, ram_phys, ram_size, entries, n, out);
++}
++
+ int xh_gpu3d_udmabuf(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_gpu_entry *entries, unsigned n)
+ {
+   xh_gpu_chunk *chunks;
+diff --git a/runtime/xnuhost/src/gpu3d.h b/runtime/xnuhost/src/gpu3d.h
+index 2d2b82b..3509b77 100644
+--- a/runtime/xnuhost/src/gpu3d.h
++++ b/runtime/xnuhost/src/gpu3d.h
+@@ -80,6 +80,9 @@ typedef struct { int fd; uint64_t size; } xh_gpu_chunk;
+ // The chunks of a blob: their count (1 or more) and `*out` (malloc'ed; the caller closes the fds and frees it), or -1
+ // and errno (EINVAL: a segment outside the RAM or not whole pages, or the memfd without F_SEAL_SHRINK).
+ int xh_gpu3d_udmabufs(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_gpu_entry *entries, unsigned n, xh_gpu_chunk **out);
++// Reuse an open udmabuf device without taking ownership. A negative fd opens it for this call.
++int xh_gpu3d_udmabufs_on(int dev_fd, int ram_fd, uint64_t ram_phys, uint64_t ram_size,
++                        const xh_gpu_entry *entries, unsigned n, xh_gpu_chunk **out);
+ void xh_gpu3d_chunks_free(xh_gpu_chunk *chunks, unsigned n);
+ // One udmabuf of segments that fit one (E2BIG when they need more).
+ int xh_gpu3d_udmabuf(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_gpu_entry *entries, unsigned n);
+diff --git a/runtime/xnuhost/src/virtio_gpu.c b/runtime/xnuhost/src/virtio_gpu.c
+index 85efbac..07bc5eb 100644
+--- a/runtime/xnuhost/src/virtio_gpu.c
++++ b/runtime/xnuhost/src/virtio_gpu.c
+@@ -297,6 +297,8 @@ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
+   uint64_t t0 = flush_now_us();
+   unsigned seg = 0, gbpp = format_bpp(g->scan.format), dformat = display_format(), dbpp = xh_pixels_bpp(dformat);
+   uint64_t seg_start = 0;                            // the blob offset at which entries[seg] begins
++  unsigned mapped_seg = b->nentries;
++  const uint8_t *mapped = NULL;
+   for (uint32_t y = 0; y < hgt && w && status == RESP_OK_NODATA; y++) {
+     uint64_t at = g->scan.offset + (uint64_t)(rect->y + y) * g->scan.stride + (uint64_t)rect->x * gbpp, left = (uint64_t)w * gbpp;
+     uint8_t *to = d->pixels + (size_t)(rect->y + y) * d->stride + (size_t)rect->x * dbpp;
+@@ -307,7 +309,12 @@ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
+       while (seg < b->nentries && at >= seg_start + b->entries[seg].length) seg_start += b->entries[seg++].length;
+       if (seg >= b->nentries) { status = RESP_ERR_INVALID_PARAMETER; break; }
+       uint64_t in = at - seg_start, n = b->entries[seg].length - in < left ? b->entries[seg].length - in : left;
+-      const uint8_t *from = xh_virtio_translate(b->entries[seg].addr + in, n);
++      if (seg != mapped_seg) {
++        mapped_seg = seg;
++        mapped = xh_virtio_translate(b->entries[seg].addr, b->entries[seg].length);
++      }
++      // A clipped flush can still be valid even if the full backing segment is out of range.
++      const uint8_t *from = mapped ? mapped + in : xh_virtio_translate(b->entries[seg].addr + in, n);
+       if (!from || (n & 3)) { status = RESP_ERR_INVALID_PARAMETER; break; }
+       uint64_t off = 0;
+       if (have) {
+@@ -642,7 +649,8 @@ static uint32_t command(gpu_state *g, const uint8_t *req, size_t size, uint8_t *
+     if (left < 20) return RESP_ERR_INVALID_PARAMETER;
+     memcpy(&rect, body, 16);
+     memcpy(&id, body + 16, 4);
+-    if (g->blobs && blob_find(g, id)) return flush_blob(g, blob_find(g, id), &rect);
++    const blob *scan = g->blobs ? blob_find(g, id) : NULL;
++    if (scan) return flush_blob(g, scan, &rect);
+     resource *r = find(g, id);
+     if (!r) return RESP_ERR_INVALID_RESOURCE_ID;
+     if (!rect_ok(&rect, r->width, r->height)) return RESP_ERR_INVALID_PARAMETER;
