@@ -65,7 +65,21 @@ jobs:
           PY
       - name: Build and verify the Metal bundle
         run: |
-          bash userland/metal/build.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("userland/metal/build.sh")
+          s = p.read_text()
+          key = "    (\"'-j6'\","
+          if s.count(key) != 1:
+              raise SystemExit("Turnip build script differs from the pinned source")
+          fix = """    ("'-fstack-protector-strong']", "'-fstack-protector-strong', '-D_DARWIN_C_SOURCE=1']", "Darwin definitions for POSIX-generated sources"),
+          """
+          p.write_text(s.replace(key, fix.rstrip() + "\n" + key))
+          PY
+          if ! bash userland/metal/build.sh; then
+            find out/metal -name '*-build.log' -exec tail -80 {} \;
+            exit 1
+          fi
           mkdir -p out/userland/metal-licenses
           cp external/NativeMetal/LICENSE out/userland/metal-licenses/NativeMetal.txt
           for f in external/metal2vulkan/LICENSE*; do cp "$f" "out/userland/metal-licenses/metal2vulkan-$(basename "$f").txt"; done
