@@ -1108,7 +1108,7 @@ index 77d00c6..12755a9 100644
        if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
      } else if (v->type == EV_ABS_ && s->touch) {
 diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
-index 2be908f..ce7152b 100644
+index 2be908f..f34f442 100644
 --- a/runtime/xnuhost/src/main.c
 +++ b/runtime/xnuhost/src/main.c
 @@ -163,6 +163,7 @@ static xl_blob sidecar(const char *suffix, size_t limit)
@@ -1174,7 +1174,7 @@ index 2be908f..ce7152b 100644
    for (unsigned i = 0; i < config.ndisk; i++) {
      xh_blk *disk = xh_blk_open(&config.disk[i], &error);
      if (!disk) { LOGE("disk %s: %s (%s)", config.disk[i].path, error, strerror(errno)); return -1; }
-@@ -816,10 +848,16 @@ static int boot(void)
+@@ -816,10 +848,17 @@ static int boot(void)
    machine.display_height = fb_height;
    machine.display_scale = config.scale;
    machine.display_hz = fb_hz;
@@ -1183,16 +1183,17 @@ index 2be908f..ce7152b 100644
    if (config.scale_fixup)
      config.text_fixups_length = xh_scale_fixups(have_image_set ? image_set.build : NULL, config.scale, config.text_fixups,
                                                  config.text_fixups_length, sizeof config.text_fixups);
-+  if (brightness && !gpu3d && have_image_set) {
++  // The S25+ Metal runtime needs panel brightness even when backboardd never initializes the plug-in.
++  if (brightness && have_image_set && (!gpu3d || runtime_metal.data)) {
 +    unsigned before = config.text_fixups_length;
 +    config.text_fixups_length = xh_backlight_fixup(image_set.build, config.boot_args, config.text_fixups,
 +                                                  before, sizeof config.text_fixups);
-+    if (config.text_fixups_length != before) LOGI("brightness: queued the 24A446 CoreBrightness fixup for 2D");
++    if (config.text_fixups_length != before) LOGI("brightness: queued the 24A446 CoreBrightness panel fixup");
 +  }
    if (config.text_fixups_length) {
      machine.text_fixups = config.text_fixups;
      machine.text_fixups_length = config.text_fixups_length;
-@@ -831,11 +869,19 @@ static int boot(void)
+@@ -831,11 +870,19 @@ static int boot(void)
    machine.user_va_limit = xh_tasks_va_limit();
    machine.host_page_size = g_info.host_page_size;
    if (getentropy(machine.random_seed, sizeof machine.random_seed)) { LOGE("no entropy for the kernel's seed"); return -1; }
