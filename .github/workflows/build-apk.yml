@@ -28,11 +28,21 @@ jobs:
           ref: bdf3db05e0aaacf996d1ec2a1bd3f0019b0a7f82
           path: source
 
+      - name: Apply OneOS v0.5.27 base merge
+        working-directory: source
+        run: |
+          git apply --check ../patch/patches/oneos-v0.5.27-base.patch
+          git apply --index ../patch/patches/oneos-v0.5.27-base.patch
+
       - name: Apply S25+ app patch
         working-directory: source
         run: |
           git apply --check ../patch/patches/s25-plus-app.patch
-          git apply ../patch/patches/s25-plus-app.patch
+          git apply --index ../patch/patches/s25-plus-app.patch
+
+      - name: Verify merged source tree
+        working-directory: source
+        run: test "$(git write-tree)" = e05905e7fe49192986253144a421157ff9ef810f
 
       - name: Java 21
         uses: actions/setup-java@v4
