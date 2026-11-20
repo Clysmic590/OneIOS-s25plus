@@ -9,10 +9,10 @@ on:
     inputs:
       metal_run_id:
         description: "Run ID containing the verified 24A446 Metal bundle"
-        default: "44743261510"
+        default: "44822977313"
         type: string
   push:
-    branches: [main]
+    branches: [build/runtime-0.1.28]
     paths:
       - .github/workflows/package-metal.yml
 permissions:
@@ -58,7 +58,7 @@ jobs:
           name: OneiOS-Metal-24A446
           path: metal
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ inputs.metal_run_id || '44743261510' }}
+          run-id: ${{ inputs.metal_run_id || '44822977313' }}
       - name: Stage the tested Metal add-on and its two CDHashes
         run: |
           python3 - <<'PY'
@@ -90,13 +90,13 @@ jobs:
         env:
           ONEIOS_BUILD_AEA: '1'
           PACKAGE_EXTRA_DIR: ${{ github.workspace }}/metal-stage
-        run: bash runtime/package.sh 0.1.27-s25plusmetal
+        run: bash runtime/package.sh 0.1.28-s25plusmetal
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Metal-Runtime-0.1.27
+          name: OneiOS-S25Plus-Metal-Runtime-0.1.28
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.27-s25plusmetal-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.27-s25plusmetal-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.28-s25plusmetal-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.28-s25plusmetal-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30

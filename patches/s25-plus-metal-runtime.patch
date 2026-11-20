@@ -1095,7 +1095,7 @@ index 866eda4..95abc8f 100644
    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
 
 diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
-index 8bfdb93..b02a688 100644
+index 8bfdb93..f363aed 100644
 --- a/runtime/xnuhost/src/config.c
 +++ b/runtime/xnuhost/src/config.c
 @@ -8,6 +8,11 @@
@@ -1119,7 +1119,7 @@ index 8bfdb93..b02a688 100644
    if (c->gpu_priority < 0) c->gpu_priority = from_image.gpu_priority < 0 ? 1 : from_image.gpu_priority;
    if (c->spin_task < 0) c->spin_task = from_image.spin_task;
    if (c->map_defer < 0) c->map_defer = from_image.map_defer;
-@@ -315,6 +320,34 @@ int xh_config_finish(xh_config *c)
+@@ -315,6 +320,38 @@ int xh_config_finish(xh_config *c)
      strcpy(c->boot_args, "debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 "
             "sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 "
             "sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=1 droidvm-gpu-metal=1");
@@ -1138,6 +1138,10 @@ index 8bfdb93..b02a688 100644
 +      fprintf(stderr, "xnuhost: Galaxy S25 built-in HID button routing enabled (%s)\n", model);
 +    }
 +    if (plus) {
++      // Raise the OneOS automatic S25+ cap by one 256 MiB step on a 12 GB phone.
++      // The fit and host-floor limits still apply below.
++      if (c->ram_bytes == 0 && c->ram_percent == 45)
++        c->ram_percent = 48;
 +      // The S25+ exclusive stream stopped accepting frames while iOS was still producing them.
 +      if (!getenv("ONEIOS_AUDIO_MMAP") && !setenv("ONEIOS_AUDIO_MMAP", "off", 0))
 +        fprintf(stderr, "xnuhost: S25+ speaker uses the Android mixer by default\n");
@@ -1154,7 +1158,7 @@ index 8bfdb93..b02a688 100644
    if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
    if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
        !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {
-@@ -652,3 +685,18 @@ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned
+@@ -652,3 +689,18 @@ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned
    }
    return length;
  }
