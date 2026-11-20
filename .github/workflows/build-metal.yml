@@ -1,0 +1,53 @@
+name: Build OneiOS Metal for 24A446
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-metal.yml
+permissions:
+  contents: read
+jobs:
+  metal:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: runtime-source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: akshaynexus/OneiOS
+          ref: 7b81012615f2278460ffa3996aa56d6889277095
+          path: runtime-source
+      - name: Prepare the iPhoneOS and renderer build tools
+        run: |
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install ninja glslang shaderc spirv-tools bison llvm flex uv
+          uv venv "$RUNNER_TEMP/metal-venv"
+          uv pip install --python "$RUNNER_TEMP/metal-venv/bin/python" meson mako pyyaml
+          echo "$RUNNER_TEMP/metal-venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+      - name: Fetch pinned renderer sources
+        run: |
+          bash scripts/setup/get-references.sh Droid-VM-UniXNU NativeMetal NativeAdreno NativeMobileDisplay AdrenoPM4 metal2vulkan mesa-droidvm
+      - name: Generate link stubs from the 24A446 SystemOS cache
+        run: |
+          cargo build --release --locked --manifest-path tools/oneios-tool/Cargo.toml
+          bash scripts/fetch/get-ipsw-cli.sh
+          bash scripts/fetch/fetch.sh --only systemos profiles/ios-27.0.1-iPhone18,2.toml
+          bash scripts/setup/ios-toolchain.sh --tbd --image inputs/24A446/043-70037-715.dmg
+      - name: Build and verify the Metal bundle
+        run: bash userland/metal/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OneiOS-Metal-24A446
+          path: |
+            runtime-source/out/userland/NativeAdrenoMetal.bundle/
+            runtime-source/out/userland/NativeAdrenoMetal.gpuaddon
+            runtime-source/out/userland/NativeAdrenoMetal.build.json
+            runtime-source/out/userland/NativeAdrenoMetal.check.txt
+          if-no-files-found: error
+          retention-days: 30
