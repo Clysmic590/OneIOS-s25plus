@@ -1117,7 +1117,7 @@ index 77d00c6..12755a9 100644
        if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
      } else if (v->type == EV_ABS_ && s->touch) {
 diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
-index 2be908f..1d2b52f 100644
+index 2be908f..f623aab 100644
 --- a/runtime/xnuhost/src/main.c
 +++ b/runtime/xnuhost/src/main.c
 @@ -163,6 +163,7 @@ static xl_blob sidecar(const char *suffix, size_t limit)
@@ -1128,7 +1128,7 @@ index 2be908f..1d2b52f 100644
  void android_set_application_target_sdk_version(int target);
  #endif
  #include <sys/prctl.h>
-@@ -521,13 +522,56 @@ static int boot(void)
+@@ -521,13 +522,55 @@ static int boot(void)
         kernel.cpusubtype == 2 ? "arm64e" : "arm64", (unsigned long long)kernel.base, kernel.nseg, kernel.nentries);
    if (kernel.cpusubtype == 2 && !(g_info.features & XH_FEATURE_PAC)) { LOGE("an arm64e kernel needs pointer authentication with keys shared across fork; this host has none"); return -1; }
  
@@ -1161,9 +1161,8 @@ index 2be908f..1d2b52f 100644
 +    } else {
 +      LOGI("gpu: 24A446 Metal runtime selected on Galaxy S25+");
 +      // The phone's 120 Hz session spent long stretches at the top KGSL level.
-+      if (!config.hz) config.hz = 60;
 +      if (!*config.gpu_level) strcpy(config.gpu_level, "governor");
-+      LOGI("gpu: S25+ Metal profile: guest refresh %u Hz, KGSL level policy %s", config.hz, config.gpu_level);
++      LOGI("gpu: S25+ Metal profile: KGSL level policy %s", config.gpu_level);
 +    }
 +  }
 +#endif
@@ -1186,7 +1185,7 @@ index 2be908f..1d2b52f 100644
    uint64_t media_bytes = strcmp(config.encoder, "off") ? MEDIA_POOL_BYTES : 0;
    uint64_t window = config.ram_bytes - fb_bytes - pool_bytes - media_bytes;
    // 2 MiB host pages for the RAM where this kernel allows them (fix-ram-hugepages; ramfix.c xh_huge_choose): shmem THP
-@@ -557,7 +601,6 @@ static int boot(void)
+@@ -557,7 +600,6 @@ static int boot(void)
    xh_gic_notify = gic_line;
    xh_gic_map();
    xh_uart_init(XL_BOARD_UART);
@@ -1194,7 +1193,7 @@ index 2be908f..1d2b52f 100644
    for (unsigned i = 0; i < config.ndisk; i++) {
      xh_blk *disk = xh_blk_open(&config.disk[i], &error);
      if (!disk) { LOGE("disk %s: %s (%s)", config.disk[i].path, error, strerror(errno)); return -1; }
-@@ -816,10 +859,17 @@ static int boot(void)
+@@ -816,10 +858,17 @@ static int boot(void)
    machine.display_height = fb_height;
    machine.display_scale = config.scale;
    machine.display_hz = fb_hz;
@@ -1213,7 +1212,7 @@ index 2be908f..1d2b52f 100644
    if (config.text_fixups_length) {
      machine.text_fixups = config.text_fixups;
      machine.text_fixups_length = config.text_fixups_length;
-@@ -831,11 +881,19 @@ static int boot(void)
+@@ -831,11 +880,19 @@ static int boot(void)
    machine.user_va_limit = xh_tasks_va_limit();
    machine.host_page_size = g_info.host_page_size;
    if (getentropy(machine.random_seed, sizeof machine.random_seed)) { LOGE("no entropy for the kernel's seed"); return -1; }
@@ -1236,7 +1235,7 @@ index 2be908f..1d2b52f 100644
      if (!trust.data) { LOGE("trust caches of %s: %s", config.image, error); return -1; }
      LOGI("trust caches: %u modules from the image set, %zu bytes", (unsigned)trust.data[0], trust.size);
    }
-@@ -1232,9 +1290,6 @@ int main(int argc, char **argv)
+@@ -1232,9 +1289,6 @@ int main(int argc, char **argv)
      snprintf(pid, sizeof pid, "%d\n", getpid());
      session_file("xnuhost.pid", pid);
    }
