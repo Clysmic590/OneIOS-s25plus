@@ -1,0 +1,1450 @@
+diff --git a/runtime/display/java/OneiOSDisplay.java b/runtime/display/java/OneiOSDisplay.java
+index 8d189c5..6e0525d 100644
+--- a/runtime/display/java/OneiOSDisplay.java
++++ b/runtime/display/java/OneiOSDisplay.java
+@@ -10,7 +10,7 @@ import java.lang.reflect.Method;
+ 
+ public final class OneiOSDisplay {
+     private static native long nOpen(String socket, int waitMs);
+-    private static native boolean nHello(long handle, int width, int height, int hz);
++    private static native boolean nHello(long handle, int width, int height, int hz, boolean direct);
+     private static native int[] nInfo(long handle);                    // width, height, stride, format
+     private static native int[] nFit(int sw, int sh, int dw, int dh);  // x, y, w, h
+     private static native int[] nBuffer(int frameFormat);              // buffer format, dataspace
+@@ -37,7 +37,7 @@ public final class OneiOSDisplay {
+ 
+     private static int usage() {
+         log("usage: oneios-display (--session DIR | --socket PATH) [--takeover] [--wait SECONDS] [--logical WxH]"
+-            + " [--hz N] [--format bgra|rgbx] [--dataspace auto|unknown|srgb|p3|scrgb|scrgb-linear] [--no-projection]");
++            + " [--hz N] [--format bgra|rgbx] [--dataspace auto|unknown|srgb|p3|scrgb|scrgb-linear] [--no-projection] [--no-direct]");
+         return 2;
+     }
+ 
+@@ -61,12 +61,13 @@ public final class OneiOSDisplay {
+     private static int run(String[] args) throws Exception {
+         String socket = null, lib = null, ready = null;
+         int wait = 30, hz = 0, format = BGRA_8888, dataspace = -1;
+-        boolean takeover = false, projection = true;
++        boolean takeover = false, projection = true, direct = true;
+         int[] logical = null;
+         for (int i = 0; i < args.length; i++) {
+             String a = args[i];
+             if (a.equals("--takeover")) { takeover = true; continue; }
+             if (a.equals("--no-projection")) { projection = false; continue; }
++            if (a.equals("--no-direct")) { direct = false; continue; }   // xnuhost copies every frame into the memfd, as before
+             if (i + 1 >= args.length) return usage();
+             String v = args[++i];
+             if (a.equals("--session")) { socket = v + "/display.sock"; ready = v + "/ready"; }
+@@ -92,7 +93,7 @@ public final class OneiOSDisplay {
+         Object transaction = TX.getConstructor().newInstance();
+         int[] panel = panel(transaction, takeover && projection, takeover, logical);
+         log("reporting the panel to xnuhost: " + panel[0] + "x" + panel[1] + " at " + panel[2] + " Hz");
+-        if (!nHello(handle, panel[0], panel[1], panel[2])) { nClose(handle); return 3; }
++        if (!nHello(handle, panel[0], panel[1], panel[2], direct)) { nClose(handle); return 3; }
+         int[] guest = nInfo(handle);
+         int[] own = nBuffer(guest[3]);
+         format = bufferFormat(guest[3], format);
+diff --git a/runtime/display/src/jni.c b/runtime/display/src/jni.c
+index cb8de6d..cb4b26e 100644
+--- a/runtime/display/src/jni.c
++++ b/runtime/display/src/jni.c
+@@ -10,9 +10,11 @@
+ #include <jni.h>
+ #include <poll.h>
+ #include <signal.h>
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/resource.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -22,7 +24,7 @@
+ 
+ // ANativeWindow_setBuffersDataSpace and _get are API 28 and libnativewindow's (the Makefile links it: libandroid does
+ // not have them); the library is built for 30, so they are there.
+-struct context { int fd; struct xhd_frame frame; };
++struct context { int fd; struct xhd_frame frame; struct xhd_direct direct; };
+ 
+ // SIGTERM, SIGINT and SIGHUP end the run loop through a pipe, so the Java half removes the layers.
+ static int signal_pipe[2] = { -1, -1 };
+@@ -55,15 +57,16 @@ JNIEXPORT jlong JNICALL Java_OneiOSDisplay_nOpen(JNIEnv *env, jclass type, jstri
+   if (fd < 0) { free(c); return 0; }
+   c->fd = fd;
+   c->frame.memfd = -1;
++  xhd_direct_init(&c->direct);
+   return (jlong)(intptr_t)c;
+ }
+ 
+ // Reports the panel's mode, then takes xnuhost's hello. JNI_FALSE: no usable hello (nClose is still the caller's).
+-JNIEXPORT jboolean JNICALL Java_OneiOSDisplay_nHello(JNIEnv *env, jclass type, jlong handle, jint width, jint height, jint hz)
++JNIEXPORT jboolean JNICALL Java_OneiOSDisplay_nHello(JNIEnv *env, jclass type, jlong handle, jint width, jint height, jint hz, jboolean direct)
+ {
+   (void)env; (void)type;
+   struct context *c = (struct context *)(intptr_t)handle;
+-  int error = xhd_send_panel(c->fd, (uint32_t)width, (uint32_t)height, (uint32_t)hz);
++  int error = xhd_send_panel(c->fd, (uint32_t)width, (uint32_t)height, (uint32_t)hz, direct ? XHD_PANEL_DIRECT : 0);
+   if (error) fprintf(stderr, "oneios-display: the panel's mode could not be sent: %s\n", strerror(-error));
+   error = xhd_recv_hello(c->fd, &c->frame, 10000);
+   if (error) fprintf(stderr, "oneios-display: no usable hello from xnuhost: %s\n", strerror(-error));
+@@ -91,7 +94,28 @@ JNIEXPORT jintArray JNICALL Java_OneiOSDisplay_nFit(JNIEnv *env, jclass type, ji
+   return array;
+ }
+ 
++static long long now_us(void)
++{
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
++}
++
++static long long cpu_us(void)
++{
++  struct rusage u;
++  getrusage(RUSAGE_SELF, &u);
++  return (long long)(u.ru_utime.tv_sec + u.ru_stime.tv_sec) * 1000000 + u.ru_utime.tv_usec + u.ru_stime.tv_usec;
++}
++
+ // Posts frames until the socket closes (0) or a signal asks to stop (1); negative on an error.
++// A direct frame (xnuhost's "frame") is hashed against what the layer shows (xhd_direct_damage): unchanged, it is
++// answered at once and nothing is locked or posted, so surfaceflinger has nothing to compose and the panel's refresh
++// rate can drop by itself; changed, only the rectangle of the changed tiles is locked and copied from the guest's pages,
++// the window keeping the rest from the last buffer (Surface::lock copies back the last post's damage into the buffer it
++// hands out, whichever of the queue's buffers that is). The answer ("done") goes after the post: xnuhost then answers
++// the guest's flush, so the guest may draw into that surface again.
++
+ // Pacing: the next buffer is only handed out when surfaceflinger has taken the last one, so
+ // ANativeWindow_lock blocks to the panel's vsync, and every flush that came meanwhile is one post.
+ // The buffer layout and dataspace a frame format gets (xhd_buffer_for): {buffer, dataspace}.
+@@ -146,9 +170,15 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+     if (p) { snprintf(ready_file, sizeof ready_file, "%s", p); (*env)->ReleaseStringUTFChars(env, ready_path, p); }
+   }
+   struct xhd_rect pending = { 0, 0, f->width, f->height };
+-  unsigned long frames = 0, held_flushes = 0;
+-  bool held = false;
++  struct xhd_direct *direct = &c->direct;
++  struct xhd_damage damage;
++  bool hashing = !xhd_damage_init(&damage, f->width, f->height);
++  if (!hashing) fprintf(stderr, "oneios-display: no memory for the damage hashes: every direct frame is copied whole\n");
++  unsigned long frames = 0, direct_frames = 0, refused = 0, held_flushes = 0;
++  bool announced = false, held = false;
+   struct timespec hold_start;
++  struct { unsigned long posted, direct, unchanged; long long lock_us, copy_us, copy_max, hash_us, rows, since, cpu; } st =
++    { 0, 0, 0, 0, 0, 0, 0, 0, now_us(), cpu_us() };
+   int result;
+   for (;;) {
+     // Held: the guest's frame is not shown yet, the damage adds up, and `ready` is looked for at every flush and
+@@ -160,18 +190,34 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+       fprintf(stderr, "oneios-display: the first frame waits for %s (xnuhost's first frame of the guest's own with content); the boot screen stays\n", ready_file);
+     }
+     struct pollfd fds[2] = { { c->fd, POLLIN, 0 }, { signal_pipe[0], POLLIN, 0 } };
+-    int ready = poll(fds, 2, hold ? XHD_HOLD_POLL_MS : pending.w ? 0 : -1);
++    int ready = poll(fds, 2, hold ? XHD_HOLD_POLL_MS : (pending.w || direct->pending) ? 0 : -1);
+     if (ready < 0 && errno != EINTR) { result = -3; break; }
+     if (stopping || (ready > 0 && fds[1].revents)) { result = 1; break; }
+-    if (xhd_drain(c->fd, f, &pending) < 0) { result = 0; break; }
++    if (xhd_drain_direct(c->fd, f, &pending, direct) < 0) { result = 0; break; }
+     if (hold) { if (ready > 0) held_flushes++; continue; }
+-    if (!pending.w) continue;
+-    // The first posts fill whole buffers; after that the window copies back what the last frame
+-    // had and hands out the rectangle that has to be drawn (it may be larger than what was asked).
+-    ARect dirty = { (int32_t)pending.x, (int32_t)pending.y, (int32_t)(pending.x + pending.w), (int32_t)(pending.y + pending.h) };
+-    if (frames < 4) dirty = (ARect){ 0, 0, (int32_t)f->width, (int32_t)f->height };
++    if (!pending.w && !direct->pending) continue;
++    // What has to be drawn: xnuhost's own damage (the memfd), and the direct frame's changed tiles.
++    struct xhd_rect want = pending, changed = { 0, 0, 0, 0 };
++    int hashed = -1;
++    long long th = now_us();
++    if (direct->pending) {
++      hashed = hashing ? xhd_direct_damage(direct, &damage, &changed) : -ENOMEM;
++      if (hashed) changed = (struct xhd_rect){ 0, 0, f->width, f->height };        // copied whole (or refused below)
++      st.hash_us += now_us() - th;
++      if (!hashed && !changed.w && !pending.w && frames >= 4) {
++        xhd_send_done(c->fd, direct->seq, XHD_DONE_UNCHANGED);                   // the layer shows it already
++        direct->pending = 0;
++        st.unchanged++;
++        goto stats;
++      }
++      xhd_rect_union(&want, &changed);
++    }
++    ARect dirty = { (int32_t)want.x, (int32_t)want.y, (int32_t)(want.x + want.w), (int32_t)(want.y + want.h) };
++    if (frames < 4 || !want.w) dirty = (ARect){ 0, 0, (int32_t)f->width, (int32_t)f->height };
+     ANativeWindow_Buffer buffer;
++    long long t0 = now_us();
+     int error = ANativeWindow_lock(window, &buffer, &dirty);
++    long long t1 = now_us();
+     if (error) {
+       if (frames == 0 && format != FORMAT_RGBX_8888) {
+         // No B,G,R,A buffers here: R,G,B,X and a swap. No RGBA_FP16 ones: B,G,R,A, the half floats encoded to sRGB
+@@ -184,23 +230,53 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+         continue;
+       }
+       fprintf(stderr, "oneios-display: the layer's buffer could not be locked (%d)\n", error);
++      if (direct->pending) xhd_send_done(c->fd, direct->seq, XHD_DONE_FAILED);
+       result = -2;
+       break;
+     }
+-    struct xhd_rect r = { 0, 0, 0, 0 };
++    uint32_t width = (uint32_t)buffer.width < f->width ? (uint32_t)buffer.width : f->width;
++    uint32_t height = (uint32_t)buffer.height < f->height ? (uint32_t)buffer.height : f->height;
++    bool usable = buffer.width > 0 && buffer.height > 0 && buffer.stride >= buffer.width;
++    int swap = buffer.format != FORMAT_BGRA_8888;
++    // The rectangle the window wants drawn (it may hand out more than was asked: a new buffer, the first ones).
+     if (dirty.left < 0) dirty.left = 0;
+     if (dirty.top < 0) dirty.top = 0;
+-    if (dirty.right > dirty.left && dirty.bottom > dirty.top) {
+-      r = (struct xhd_rect){ (uint32_t)dirty.left, (uint32_t)dirty.top, (uint32_t)(dirty.right - dirty.left), (uint32_t)(dirty.bottom - dirty.top) };
+-      uint32_t width = (uint32_t)buffer.width < f->width ? (uint32_t)buffer.width : f->width;
+-      uint32_t height = (uint32_t)buffer.height < f->height ? (uint32_t)buffer.height : f->height;
+-      // The buffer's own format decides the copy (RGBA_8888 and RGBX_8888 are both R,G,B bytes).
+-      int layout = buffer.format == FORMAT_BGRA_8888 || buffer.format == FORMAT_RGBA_FP16 ? buffer.format : FORMAT_RGBX_8888;
+-      size_t bytes = layout == FORMAT_RGBA_FP16 ? 8 : 4;
+-      if (buffer.width > 0 && buffer.height > 0 && buffer.stride >= buffer.width && xhd_rect_clip(&r, width, height))
+-        xhd_copy(buffer.bits, (size_t)buffer.stride * bytes, layout, f->pixels, f->stride, f->format, r);
++    struct xhd_rect fill = { 0, 0, 0, 0 };
++    if (dirty.right > dirty.left && dirty.bottom > dirty.top)
++      fill = (struct xhd_rect){ (uint32_t)dirty.left, (uint32_t)dirty.top, (uint32_t)(dirty.right - dirty.left), (uint32_t)(dirty.bottom - dirty.top) };
++    if (frames < 4) fill = (struct xhd_rect){ 0, 0, f->width, f->height };
++    int direct_failed = 0;
++    // The buffer's own format decides the copy (RGBA_8888 and RGBX_8888 are both R,G,B bytes).
++    int layout = buffer.format == FORMAT_BGRA_8888 || buffer.format == FORMAT_RGBA_FP16 ? buffer.format : FORMAT_RGBX_8888;
++    size_t bytes = layout == FORMAT_RGBA_FP16 ? 8 : 4;
++    if (usable && xhd_rect_clip(&fill, width, height)) {
++      if (direct->pending && bytes == 4) {
++        // The guest's surface has the whole frame: all of `fill` comes from it. What xnuhost drew itself in the memfd
++        // (pending) goes over it, and the layer then no longer matches the hashes there.
++        struct xhd_rect done;
++        int copied = xhd_copy_direct(direct, buffer.bits, (size_t)buffer.stride * 4, width, height, swap, &fill, &done);
++        if (copied) { refused++; direct_failed = 1; if (refused == 1) fprintf(stderr, "oneios-display: a direct frame could not be copied (%s)\n", strerror(-copied)); }
++        else { direct_frames++; st.direct++; st.rows += done.h; }
++        struct xhd_rect own = pending;
++        if (own.w && xhd_rect_clip(&own, width, height)) xhd_copy(buffer.bits, (size_t)buffer.stride * bytes, layout, f->pixels, f->stride, f->format, own);
++        if (copied || pending.w) damage.valid = 0;
++      } else {
++        // Every pixel is xnuhost's: the window's rectangle comes from the memfd. Once frames come direct the memfd is
++        // stale, so then only xnuhost's own damage does. (A direct frame with a half-float buffer is not copied from
++        // guest RAM: refused, so xnuhost copies the next ones itself.)
++        if (direct->pending) { refused++; direct_failed = 1; }
++        struct xhd_rect r = direct_frames ? pending : fill;
++        if (r.w && xhd_rect_clip(&r, width, height)) xhd_copy(buffer.bits, (size_t)buffer.stride * bytes, layout, f->pixels, f->stride, f->format, r);
++        damage.valid = 0;
++      }
+     }
++    long long t2 = now_us();
+     ANativeWindow_unlockAndPost(window);
++    if (direct->pending) {
++      if (!direct_failed && !hashed && !pending.w) xhd_damage_commit(&damage);
++      xhd_send_done(c->fd, direct->seq, direct_failed ? XHD_DONE_FAILED : 0);
++      direct->pending = 0;
++    }
+     if (frames++ == 0) {
+       char waited[96] = "";
+       if (held) snprintf(waited, sizeof waited, "; held %.1f s for session/ready, %lu wakes for flushes not shown", seconds_since(&hold_start), held_flushes);
+@@ -208,8 +284,29 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+               buffer.width, buffer.height, buffer.stride, buffer.format, format_name(buffer.format), (unsigned)ANativeWindow_getBuffersDataSpace(window),
+               xhd_dataspace_name(ANativeWindow_getBuffersDataSpace(window)), xh_pixels_name(f->format), waited);
+     }
++    if (direct_frames && !announced) {
++      announced = true;
++      fprintf(stderr, "oneios-display: frames come straight from guest RAM now, only their changed tiles copied and posted\n");
++    }
+     pending = (struct xhd_rect){ 0, 0, 0, 0 };
++    st.posted++; st.lock_us += t1 - t0; st.copy_us += t2 - t1;
++    if (t2 - t1 > st.copy_max) st.copy_max = t2 - t1;
++  stats:;
++    // Reported when a frame comes and 10 s have passed since the last report: no timer, so nothing at all when idle.
++    long long now = now_us();
++    if (now - st.since >= 10000000) {
++      long long cpu = cpu_us();
++      unsigned long seen = st.posted + st.unchanged;
++      fprintf(stderr, "oneios-display: %.0f s: %lu frames from xnuhost, %lu unchanged (nothing posted), %lu posted (%lu from guest RAM, "
++              "%.0f%% of the rows copied); hash mean %.1f ms; buffer wait mean %.1f ms; copy mean %.1f ms, max %.1f ms; this process %.0f%% of a core\n",
++              (now - st.since) / 1e6, seen, st.unchanged, st.posted, st.direct,
++              st.direct ? st.rows * 100.0 / ((double)st.direct * f->height) : 0.0, seen ? st.hash_us / 1000.0 / seen : 0.0,
++              st.posted ? st.lock_us / 1000.0 / st.posted : 0.0, st.posted ? st.copy_us / 1000.0 / st.posted : 0.0, st.copy_max / 1000.0,
++              (cpu - st.cpu) * 100.0 / (double)(now - st.since));
++      st = (__typeof__(st)){ 0, 0, 0, 0, 0, 0, 0, 0, now, cpu };
++    }
+   }
++  xhd_damage_free(&damage);
+   ANativeWindow_release(window);
+   fprintf(stderr, "oneios-display: %s after %lu frames\n", result == 0 ? "the socket closed" : result == 1 ? "asked to stop" : "error", frames);
+   return result;
+@@ -222,5 +319,6 @@ JNIEXPORT void JNICALL Java_OneiOSDisplay_nClose(JNIEnv *env, jclass type, jlong
+   if (!c) return;
+   close(c->fd);
+   xhd_frame_close(&c->frame);
++  xhd_direct_close(&c->direct);
+   free(c);
+ }
+diff --git a/runtime/display/src/xhd.c b/runtime/display/src/xhd.c
+index 057da4d..1bf3f59 100644
+--- a/runtime/display/src/xhd.c
++++ b/runtime/display/src/xhd.c
+@@ -2,9 +2,10 @@
+ #define _GNU_SOURCE
+ #include "xhd.h"
+ #include <errno.h>
++#include <poll.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+-#include <poll.h>
+ #include <sys/mman.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+@@ -57,9 +58,9 @@ int xhd_connect(const char *path, int wait_ms, const volatile int *stop)
+   }
+ }
+ 
+-int xhd_send_panel(int fd, uint32_t width, uint32_t height, uint32_t hz)
++int xhd_send_panel(int fd, uint32_t width, uint32_t height, uint32_t hz, uint32_t flags)
+ {
+-  struct xhd_message m = { { 'X', 'H', 'D', 'P' }, width, height, hz, 0 };
++  struct xhd_message m = { { 'X', 'H', 'D', 'P' }, width, height, hz, flags };
+   return send(fd, &m, sizeof m, MSG_NOSIGNAL) < 0 ? -errno : 0;
+ }
+ 
+@@ -129,32 +130,225 @@ void xhd_rect_union(struct xhd_rect *into, const struct xhd_rect *r)
+   into->x = x0; into->y = y0; into->w = (uint32_t)(x1 - x0); into->h = (uint32_t)(y1 - y0);
+ }
+ 
++int xhd_drain(int fd, const struct xhd_frame *frame, struct xhd_rect *damage) { return xhd_drain_direct(fd, frame, damage, NULL); }
++
++void xhd_direct_init(struct xhd_direct *d)
++{
++  memset(d, 0, sizeof *d);
++  d->ram_fd = d->table_fd = -1;
++}
++
++void xhd_direct_close(struct xhd_direct *d)
++{
++  if (d->ram) munmap((void *)d->ram, d->ram_size);
++  if (d->table) munmap((void *)d->table, d->table_bytes);
++  if (d->ram_fd >= 0) close(d->ram_fd);
++  if (d->table_fd >= 0) close(d->table_fd);
++  xhd_direct_init(d);
++}
++
++// xnuhost's "memory": guest RAM and the table, both mapped read-only. Only the first is taken.
++static void direct_memory(struct xhd_direct *d, const struct xhd_message *m, const int *fds, unsigned nfds)
++{
++  uint64_t ram = (uint64_t)m->a | (uint64_t)m->b << 32;
++  struct stat a, b;
++  if (!d || d->ram || nfds != 2 || !m->c || m->c > 64 || m->d < sizeof(struct xhd_slot) || m->d > (64u << 20) || m->d % 8 ||
++      fstat(fds[0], &a) || fstat(fds[1], &b) || !ram || (uint64_t)a.st_size < ram || (uint64_t)b.st_size < (uint64_t)m->c * m->d) return;
++  void *rm = mmap(NULL, ram, PROT_READ, MAP_SHARED, fds[0], 0);
++  if (rm == MAP_FAILED) return;
++  void *tm = mmap(NULL, (size_t)m->c * m->d, PROT_READ, MAP_SHARED, fds[1], 0);
++  if (tm == MAP_FAILED) { munmap(rm, ram); return; }
++  d->ram = rm; d->ram_size = ram; d->table = tm; d->table_bytes = (size_t)m->c * m->d; d->slots = m->c; d->slot_bytes = m->d;
++  d->ram_fd = dup(fds[0]); d->table_fd = dup(fds[1]);
++}
++
+ int xhd_hold_first(const char *ready)
+ {
+   struct stat st;
+   return ready && *ready && stat(ready, &st) && errno == ENOENT;
+ }
+ 
+-int xhd_drain(int fd, const struct xhd_frame *frame, struct xhd_rect *damage)
++int xhd_drain_direct(int fd, const struct xhd_frame *frame, struct xhd_rect *damage, struct xhd_direct *direct)
+ {
+   // A bound on one round: a guest that floods flushes must not keep the frame from being posted.
+   for (int i = 0; i < 4096; i++) {
+     struct xhd_message m;
+-    ssize_t n = recv(fd, &m, sizeof m, MSG_DONTWAIT);
++    char control[CMSG_SPACE(sizeof(int) * 4)];
++    struct iovec iov = { &m, sizeof m };
++    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control };
++    ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+     if (n < 0) {
+       if (errno == EINTR) continue;
+       if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+       fprintf(stderr, "oneios-display: reading xnuhost's socket failed: %s\n", strerror(errno));
+       return -1;
+     }
++    int fds[4];
++    unsigned nfds = 0;
++    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
++      if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
++      size_t count = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++      for (size_t k = 0; k < count; k++) {
++        int got;
++        memcpy(&got, CMSG_DATA(cm) + k * sizeof(int), sizeof(int));
++        if (nfds < 4) fds[nfds++] = got; else close(got);
++      }
++    }
++    if (n == sizeof m && !memcmp(m.magic, "XHDM", 4)) direct_memory(direct, &m, fds, nfds);
++    for (unsigned k = 0; k < nfds; k++) close(fds[k]);                // kept ones were duplicated
+     if (n == 0) { fprintf(stderr, "oneios-display: xnuhost closed the socket\n"); return -1; }
+-    if (n != sizeof m || memcmp(m.magic, "XHDF", 4)) continue;      // not a flush: ignored
++    if (n != sizeof m) continue;
++    if (!memcmp(m.magic, "XHDS", 4)) {
++      // The newest frame wins; the answer for it covers the ones before it.
++      uint64_t seq = (uint64_t)m.b | (uint64_t)m.c << 32;
++      if (direct && direct->ram && m.a < direct->slots && (!direct->pending || seq > direct->seq)) { direct->pending = 1; direct->slot = m.a; direct->seq = seq; }
++      continue;
++    }
++    if (memcmp(m.magic, "XHDF", 4)) continue;                         // not a flush: ignored
+     struct xhd_rect r = { m.a, m.b, m.c, m.d };
+     if (xhd_rect_clip(&r, frame->width, frame->height)) xhd_rect_union(damage, &r);
+   }
+   return 0;
+ }
+ 
++// The rows of the slot's frame: a cursor over its segments, for rows that only go forward. Calls `piece` for each run of
++// guest bytes in [x, x + w) of a row, in order. -EINVAL when the rows reach past the segments or a segment past RAM.
++struct walk { const struct xhd_direct *d; struct xhd_slot s; const struct xhd_seg *segs; unsigned at; uint64_t start; };
++
++static int walk_open(struct walk *k, const struct xhd_direct *d)
++{
++  if (!d->ram || !d->pending || d->slot >= d->slots) return -EINVAL;
++  const uint8_t *base = d->table + (size_t)d->slot * d->slot_bytes;
++  memcpy(&k->s, base, sizeof k->s);
++  if (__atomic_load_n((const uint64_t *)base, __ATOMIC_ACQUIRE) != d->seq || k->s.seq != d->seq) return -ESTALE;   // reused already
++  if (k->s.format != 1 || !k->s.width || !k->s.height || k->s.stride < (uint64_t)k->s.width * 4 ||
++      k->s.nsegs > (d->slot_bytes - sizeof k->s) / sizeof(struct xhd_seg)) return -EINVAL;
++  k->d = d; k->segs = (const struct xhd_seg *)(base + sizeof k->s); k->at = 0; k->start = 0;
++  return 0;
++}
++
++typedef void (*piece_fn)(void *ctx, const uint8_t *from, uint64_t bytes);
++static int walk_row(struct walk *k, uint32_t row, uint32_t x, uint32_t w, piece_fn piece, void *ctx)
++{
++  uint64_t want = k->s.offset + (uint64_t)row * k->s.stride + (uint64_t)x * 4, left = (uint64_t)w * 4;
++  while (k->at < k->s.nsegs && want >= k->start + k->segs[k->at].length) { k->start += k->segs[k->at].length; k->at++; }
++  unsigned i = k->at;
++  uint64_t i_start = k->start, pos = want;
++  while (left) {
++    if (i >= k->s.nsegs) return -EINVAL;
++    const struct xhd_seg *g = &k->segs[i];
++    if (g->offset > k->d->ram_size || g->length > k->d->ram_size - g->offset || pos < i_start) return -EINVAL;
++    uint64_t in = pos - i_start, n = g->length - in < left ? g->length - in : left;
++    piece(ctx, k->d->ram + g->offset + in, n);
++    left -= n; pos += n;
++    if (left) { i_start += g->length; i++; }
++  }
++  return 0;
++}
++
++struct copy_ctx { uint8_t *to; int swap; };
++static void copy_piece(void *ctx, const uint8_t *from, uint64_t n)
++{
++  struct copy_ctx *c = ctx;
++  if (!c->swap) memcpy(c->to, from, (size_t)n);
++  else for (uint64_t i = 0; i + 4 <= n; i += 4) { c->to[i] = from[i + 2]; c->to[i + 1] = from[i + 1]; c->to[i + 2] = from[i]; c->to[i + 3] = 0xff; }
++  c->to += n;
++}
++
++int xhd_copy_direct(const struct xhd_direct *d, uint8_t *dst, size_t dst_stride, uint32_t dst_width, uint32_t dst_height, int swap,
++                    const struct xhd_rect *only, struct xhd_rect *done)
++{
++  memset(done, 0, sizeof *done);
++  struct walk k;
++  int e = walk_open(&k, d);
++  if (e) return e;
++  struct xhd_rect r = only ? *only : (struct xhd_rect){ k.s.x, k.s.y, k.s.w, k.s.h };
++  if (!xhd_rect_clip(&r, k.s.width, k.s.height) || !xhd_rect_clip(&r, dst_width, dst_height)) return 0;
++  for (uint32_t row = r.y; row < r.y + r.h; row++) {
++    struct copy_ctx c = { dst + (size_t)row * dst_stride + (size_t)r.x * 4, swap };
++    if ((e = walk_row(&k, row, r.x, r.w, copy_piece, &c))) return e;
++  }
++  *done = r;
++  return 0;
++}
++
++// ---- damage -----------------------------------------------------------------------------------
++// Four lanes by pixel index (`at`, the pixel's place in the stream), each a multiply-add over the pixel's B,G,R: a
++// function of the bytes and their order alone, however the stream is cut into pieces.
++uint64_t xhd_hash_pixels(uint64_t state[4], const uint8_t *p, size_t bytes, size_t at)
++{
++  const uint64_t K = 0x9e3779b97f4a7c15ull;
++  for (size_t i = 0; i + 4 <= bytes; i += 4, at++) {
++    uint32_t v;
++    memcpy(&v, p + i, 4);
++    state[at & 3] = (state[at & 3] + (v & 0x00ffffffu) + 1) * K;
++  }
++  return at;
++}
++
++int xhd_damage_init(struct xhd_damage *d, uint32_t width, uint32_t height)
++{
++  memset(d, 0, sizeof *d);
++  size_t n = (size_t)height * XHD_TILES;
++  d->shown = calloc(n, sizeof *d->shown);
++  d->next = calloc(n, sizeof *d->next);
++  if (!d->shown || !d->next) { xhd_damage_free(d); return -ENOMEM; }
++  d->width = width; d->height = height; d->tile = (width + XHD_TILES - 1) / XHD_TILES;
++  return 0;
++}
++
++void xhd_damage_free(struct xhd_damage *d)
++{
++  free(d->shown); free(d->next);
++  memset(d, 0, sizeof *d);
++}
++
++struct hash_ctx { uint64_t lane[4]; size_t at; };
++static void hash_piece(void *ctx, const uint8_t *from, uint64_t n)
++{
++  struct hash_ctx *h = ctx;
++  h->at = xhd_hash_pixels(h->lane, from, (size_t)n, h->at);
++}
++
++int xhd_direct_damage(const struct xhd_direct *dir, struct xhd_damage *d, struct xhd_rect *dirty)
++{
++  memset(dirty, 0, sizeof *dirty);
++  struct walk k;
++  int e = walk_open(&k, dir);
++  if (e) return e;
++  uint32_t width = k.s.width < d->width ? k.s.width : d->width, height = k.s.height < d->height ? k.s.height : d->height;
++  uint32_t x0 = UINT32_MAX, x1 = 0, y0 = UINT32_MAX, y1 = 0;
++  for (uint32_t row = 0; row < height; row++)
++    for (uint32_t t = 0; t < XHD_TILES; t++) {
++      uint32_t x = t * d->tile, w = x >= width ? 0 : (width - x < d->tile ? width - x : d->tile);
++      if (!w) continue;
++      struct hash_ctx h = { { 1, 2, 3, 4 }, 0 };
++      if ((e = walk_row(&k, row, x, w, hash_piece, &h))) return e;
++      uint64_t v = h.lane[0] ^ (h.lane[1] * 3) ^ (h.lane[2] * 5) ^ (h.lane[3] * 7) ^ ((uint64_t)w << 48), *slot = &d->next[(size_t)row * XHD_TILES + t];
++      *slot = v;
++      if (d->valid && d->shown[(size_t)row * XHD_TILES + t] == v) continue;
++      if (x < x0) x0 = x;
++      if (x + w > x1) x1 = x + w;
++      if (row < y0) y0 = row;
++      y1 = row + 1;
++    }
++  if (y0 != UINT32_MAX) *dirty = (struct xhd_rect){ x0, y0, x1 - x0, y1 - y0 };
++  return 0;
++}
++
++void xhd_damage_commit(struct xhd_damage *d)
++{
++  uint64_t *t = d->shown;
++  d->shown = d->next; d->next = t;
++  d->valid = 1;
++}
++
++int xhd_send_done(int fd, uint64_t seq, uint32_t flags)
++{
++  struct xhd_message m = { { 'X', 'H', 'D', 'A' }, (uint32_t)seq, (uint32_t)(seq >> 32), flags, 0 };
++  return send(fd, &m, sizeof m, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 ? -errno : 0;
++}
++
+ void xhd_fit(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, struct xhd_fit *fit)
+ {
+   memset(fit, 0, sizeof *fit);
+diff --git a/runtime/display/src/xhd.h b/runtime/display/src/xhd.h
+index 6f01fee..7ebaa71 100644
+--- a/runtime/display/src/xhd.h
++++ b/runtime/display/src/xhd.h
+@@ -36,7 +36,12 @@ int xhd_dataspace_parse(const char *name);
+ //   hello  { "XHD1", width, height, stride, format } + the frame memfd (SCM_RIGHTS)
+ //   flush  { "XHDF", x, y, w, h }
+ // and from the helper, straight after connecting (xnuhost waits for it before it sizes the frame in a session):
+-//   panel  { "XHDP", width, height, hz, 0 }
++//   panel  { "XHDP", width, height, hz, flags }      flags bit 0 (XHD_PANEL_DIRECT): frames may come as "frame" below
++// Direct frames (runtime/xnuhost/src/display.c): the helper copies the guest's scanout from guest RAM itself.
++//   memory { "XHDM", RAM bytes low, high, slots, slot bytes } + the RAM memfd and the table memfd (SCM_RIGHTS)
++//   frame  { "XHDS", slot, seq low, seq high, 0 }    described by that slot of the table (struct xhd_slot, then segments)
++//   done   { "XHDA", seq low, seq high, flags, 0 }   (helper -> xnuhost) the frames up to seq are in the layer; flags
++//          bit 0 (XHD_DONE_FAILED): the last could not be copied, and xnuhost goes back to copying frames itself
+ struct xhd_message { char magic[4]; uint32_t a, b, c, d; };
+ 
+ struct xhd_rect { uint32_t x, y, w, h; };            // w == 0: empty
+@@ -54,14 +59,58 @@ int xhd_check_hello(const struct xhd_message *m, size_t length, off_t memfd_size
+ // Connect to the socket at path, waiting up to wait_ms for it to appear; *stop != 0 ends the wait.
+ // Refuses anything that is not a socket (a link included). Returns the fd or -errno.
+ int xhd_connect(const char *path, int wait_ms, const volatile int *stop);
+-// Tell xnuhost the panel's mode. 0 or -errno.
+-int xhd_send_panel(int fd, uint32_t width, uint32_t height, uint32_t hz);
++// Tell xnuhost the panel's mode (and XHD_PANEL_DIRECT in flags: direct frames are welcome). 0 or -errno.
++#define XHD_PANEL_DIRECT 1u
++int xhd_send_panel(int fd, uint32_t width, uint32_t height, uint32_t hz, uint32_t flags);
++
++// A slot of the direct table, as xnuhost writes it: the frame `seq`, rows of `stride` bytes from byte `offset` of the
++// segments (the guest's pages as offsets into the RAM memfd, in the scanout's order), `width` x `height`, the
++// rectangle x, y, w, h changed, format 1 (B,G,R,X/A). seq is written last.
++struct xhd_slot { uint64_t seq, offset; uint32_t stride, width, height, nsegs, x, y, w, h, format, pad[3]; };
++struct xhd_seg { uint64_t offset, length; };
++struct xhd_direct {
++  int ram_fd, table_fd;
++  const uint8_t *ram, *table;                         // read-only maps; NULL until xnuhost's "memory"
++  uint64_t ram_size;
++  size_t table_bytes;
++  uint32_t slots, slot_bytes;
++  int pending;                                        // a frame came: the newest is slot / seq
++  uint32_t slot;
++  uint64_t seq;
++};
++void xhd_direct_init(struct xhd_direct *d);
++void xhd_direct_close(struct xhd_direct *d);
++// Copy a rectangle of the pending frame (`only`, or NULL: the slot's changed rectangle; clipped to the frame and to
++// dst_width x dst_height) from guest RAM into a B,G,R,X/A buffer (swap: R,G,B,X, alpha 0xff). 0, with *done the
++// rectangle, or -errno: a slot that changed or does not fit RAM copies nothing.
++int xhd_copy_direct(const struct xhd_direct *d, uint8_t *dst, size_t dst_stride, uint32_t dst_width, uint32_t dst_height, int swap,
++                    const struct xhd_rect *only, struct xhd_rect *done);
++
++// What changed: the guest flushes its whole surface every frame (its swap carries no dirty region), so the helper finds
++// the damage itself. Each row is cut into XHD_TILES tiles; a tile's hash is of its pixels' B,G,R bytes (not X) as a
++// stream, so the same picture in another surface (the compositor rotates three, scattered differently over RAM) hashes
++// the same. `shown` holds the hashes of what the layer shows, valid once a whole frame was posted.
++#define XHD_TILES 4
++struct xhd_damage { uint32_t width, height, tile; uint64_t *shown, *next; int valid; };
++int  xhd_damage_init(struct xhd_damage *d, uint32_t width, uint32_t height);   // 0 or -ENOMEM
++void xhd_damage_free(struct xhd_damage *d);
++// Hashes the pending frame (all of it) and compares: 0 with *dirty the bounding rectangle of the tiles that differ from
++// what is shown (w == 0: the frame is what the layer already shows; nothing to post), or -errno (as xhd_copy_direct).
++int  xhd_direct_damage(const struct xhd_direct *dir, struct xhd_damage *d, struct xhd_rect *dirty);
++// The frame just hashed is in the layer now (posted whole or its damage over the rest).
++void xhd_damage_commit(struct xhd_damage *d);
++uint64_t xhd_hash_pixels(uint64_t state[4], const uint8_t *p, size_t bytes, size_t at);   // (for the tests)
++#define XHD_DONE_FAILED 1u
++#define XHD_DONE_UNCHANGED 2u                         // the frame was what the layer showed: nothing was posted
++int xhd_send_done(int fd, uint64_t seq, uint32_t flags);
+ // Receive the hello and map the frame. 0 or -errno.
+ int xhd_recv_hello(int fd, struct xhd_frame *frame, int timeout_ms);
+ void xhd_frame_close(struct xhd_frame *frame);
+ // Read every pending flush without blocking, adding each (clipped to the frame) to *damage.
+ // 0 the socket is open, -1 it closed.
+ int xhd_drain(int fd, const struct xhd_frame *frame, struct xhd_rect *damage);
++// The same, and with `direct` (may be NULL: those messages are then ignored) the "memory" and "frame" messages too.
++int xhd_drain_direct(int fd, const struct xhd_frame *frame, struct xhd_rect *damage, struct xhd_direct *direct);
+ 
+ // The first post waits for the guest (2026-11-15): the layer is above the OneOS boot screen and opaque, so a posted
+ // frame covers it, and until session/ready the frame is black (the empty memfd, then backboardd's first frames) or the
+diff --git a/runtime/display/tests/test_display.c b/runtime/display/tests/test_display.c
+index 495a06c..28bb3cb 100644
+--- a/runtime/display/tests/test_display.c
++++ b/runtime/display/tests/test_display.c
+@@ -196,6 +196,69 @@ static void test_copy(void)
+   CHECK(dst[0] == 0xee && dst[DS * 4] == 0xee && dst[DS + 7] == 0xee && dst[DS + 24] == 0xee);
+ }
+ 
++// ---- direct frames: guest RAM and the table from xnuhost, the rows copied from scattered segments --------
++static void send_fds(int fd, const struct xhd_message *m, const int *fds, int n)
++{
++  char control[CMSG_SPACE(sizeof(int) * 2)];
++  struct iovec iov = { (void *)m, sizeof *m };
++  struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)n) };
++  memset(control, 0, sizeof control);
++  struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
++  cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)n);
++  memcpy(CMSG_DATA(cm), fds, sizeof(int) * (size_t)n);
++  sendmsg(fd, &msg, 0);
++}
++
++static void test_direct(void)
++{
++  enum { RAM = 0x10000, SLOTS = 4, SLOT = 64 + 8 * 16, W = 10, H = 100, STRIDE = 48, DS = 44 };
++  int ram = xhd_memfd("test-ram", RAM), tab = xhd_memfd("test-table", SLOTS * SLOT), pair[2];
++  CHECK(ram >= 0 && tab >= 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0);
++  uint8_t *rp = mmap(NULL, RAM, PROT_READ | PROT_WRITE, MAP_SHARED, ram, 0), *tp = mmap(NULL, SLOTS * SLOT, PROT_READ | PROT_WRITE, MAP_SHARED, tab, 0);
++  for (size_t i = 0; i < RAM; i++) rp[i] = (uint8_t)(i * 13 + (i >> 8));
++  // The scanout: 4800 bytes in two pages out of order, so row 85 runs from one into the other.
++  struct xhd_slot *slot = (struct xhd_slot *)(tp + 2 * SLOT);
++  struct xhd_seg *segs = (struct xhd_seg *)(slot + 1);
++  segs[0] = (struct xhd_seg){ 0x8000, 0x1000 }; segs[1] = (struct xhd_seg){ 0x2000, 0x1000 };
++  *slot = (struct xhd_slot){ 7, 0, STRIDE, W, H, 2, 1, 0, 8, H, 1, { 0 } };
++  struct xhd_message mem = { { 'X', 'H', 'D', 'M' }, RAM, 0, SLOTS, SLOT }, frame = { { 'X', 'H', 'D', 'S' }, 2, 7, 0, 0 };
++  int fds[2] = { ram, tab };
++  send_fds(pair[0], &mem, fds, 2);
++  send(pair[0], &frame, sizeof frame, 0);
++  struct xhd_frame f = { .width = W, .height = H };
++  struct xhd_direct d;
++  xhd_direct_init(&d);
++  struct xhd_rect damage = { 0, 0, 0, 0 };
++  CHECK(xhd_drain_direct(pair[1], &f, &damage, &d) == 0 && d.ram && d.ram_size == RAM && d.slots == SLOTS && d.pending && d.slot == 2 && d.seq == 7);
++  static uint8_t dst[DS * H], want[DS * H];
++  memset(dst, 0xee, sizeof dst); memset(want, 0xee, sizeof want);
++  for (uint32_t y = 0; y < H; y++) for (uint32_t x = 1; x < 9; x++) for (int b = 0; b < 4; b++) {
++    uint64_t at = (uint64_t)y * STRIDE + x * 4 + (uint64_t)b;
++    want[y * DS + x * 4 + (uint32_t)b] = rp[(at < 0x1000 ? 0x8000 : 0x2000 - 0x1000) + at];
++  }
++  struct xhd_rect done;
++  CHECK(xhd_copy_direct(&d, dst, DS, W, H, 0, NULL, &done) == 0 && done.x == 1 && done.w == 8 && done.h == H);
++  CHECK(!memcmp(dst, want, sizeof dst));                                 // every row, across the two pages, nothing else
++  CHECK(xhd_copy_direct(&d, dst, DS, W, H, 1, NULL, &done) == 0);
++  CHECK(dst[85 * DS + 4] == want[85 * DS + 6] && dst[85 * DS + 6] == want[85 * DS + 4] && dst[85 * DS + 7] == 0xff);   // swapped
++  CHECK(xhd_copy_direct(&d, dst, DS, 4, 3, 0, NULL, &done) == 0 && done.w == 3 && done.h == 3);                // clipped to the buffer
++  slot->nsegs = 1;
++  CHECK(xhd_copy_direct(&d, dst, DS, W, H, 0, NULL, &done) == -EINVAL);                                         // rows past the segments
++  slot->nsegs = 2; segs[1].offset = RAM - 0x800;
++  CHECK(xhd_copy_direct(&d, dst, DS, W, H, 0, NULL, &done) == -EINVAL);                                         // a segment past the RAM
++  segs[1].offset = 0x2000; slot->seq = 11;
++  CHECK(xhd_copy_direct(&d, dst, DS, W, H, 0, NULL, &done) == -ESTALE);                                         // the slot was reused
++  frame.b = 5;                                                                                              // an older frame: the newer stays
++  send(pair[0], &frame, sizeof frame, 0);
++  CHECK(xhd_drain_direct(pair[1], &f, &damage, &d) == 0 && d.seq == 7);
++  CHECK(xhd_send_done(pair[1], 7, 0) == 0);
++  struct xhd_message a;
++  CHECK(recv(pair[0], &a, sizeof a, 0) == (ssize_t)sizeof a && !memcmp(a.magic, "XHDA", 4) && a.a == 7 && a.b == 0);
++  xhd_direct_close(&d);
++  munmap(rp, RAM); munmap(tp, SLOTS * SLOT);
++  close(ram); close(tab); close(pair[0]); close(pair[1]);
++}
++
+ // ---- the protocol against a serving thread --------------------------------------------------
+ struct server { char path[200]; int delay_ms; uint32_t width, height; int mode; int done; };
+ 
+@@ -240,10 +303,10 @@ static void test_panel_report(void)
+ {
+   int pair[2];
+   CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0);
+-  CHECK(xhd_send_panel(pair[0], 1440, 3120, 120) == 0);
++  CHECK(xhd_send_panel(pair[0], 1440, 3120, 120, XHD_PANEL_DIRECT) == 0);
+   struct xhd_message m;
+   CHECK(recv(pair[1], &m, sizeof m, 0) == (ssize_t)sizeof m);
+-  CHECK(!memcmp(m.magic, "XHDP", 4) && m.a == 1440 && m.b == 3120 && m.c == 120 && m.d == 0);
++  CHECK(!memcmp(m.magic, "XHDP", 4) && m.a == 1440 && m.b == 3120 && m.c == 120 && m.d == 1);
+   close(pair[0]);
+   close(pair[1]);
+ }
+@@ -427,6 +490,7 @@ int main(int argc, char **argv)
+   test_formats();
+   test_copy_formats();
+   test_panel_report();
++  test_direct();
+   test_hold_first(dir);
+   test_protocol(dir);
+   if (argc > 1) test_displayctl(argv[1], dir);
+diff --git a/runtime/xnuhost/Makefile b/runtime/xnuhost/Makefile
+index aeaef7b..12a3bbd 100644
+--- a/runtime/xnuhost/Makefile
++++ b/runtime/xnuhost/Makefile
+@@ -136,10 +136,12 @@ $(A)/xnuhost: $(SRC:%=$(A)/%.o) $(A)/kctx.o $(A)/arch.o $(patsubst ../loader/src
+ $(H)/test_xnuhost: tests/test_xnuhost.c $(PORTABLE:%=src/%.c) ../bridges/hw/hw_backend.c $(HDR)
+ 	@mkdir -p $(H)
+ 	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -DXH_HOST_TEST -fsanitize=address,undefined tests/test_xnuhost.c $(PORTABLE:%=src/%.c) ../loader/src/adt.c ../loader/src/boot.c ../bridges/hw/hw_backend.c -lpthread -lm -o $@
+-# The real display.c (tests of test_xnuhost replace it) against a stand-in helper on the real socket. (config.c asks ramfix.c whether a lock can work: xh_ram_can_lock)
+-$(H)/test_display_mode: tests/test_display_mode.c src/display.c src/config.c src/ramfix.c src/log.c ../bridges/hw/hw_backend.c $(HDR)
++# The real display.c (tests of test_xnuhost replace it) against a stand-in helper on the real socket, with the display
++# helper's own protocol code (runtime/display/src/xhd.c) on the other end for the direct frames. (config.c asks ramfix.c
++# whether a lock can work: xh_ram_can_lock)
++$(H)/test_display_mode: tests/test_display_mode.c src/display.c src/config.c src/ramfix.c src/log.c ../display/src/xhd.c ../display/src/xhd.h ../bridges/hw/hw_backend.c $(HDR)
+ 	@mkdir -p $(H)
+-	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -fsanitize=address,undefined tests/test_display_mode.c src/display.c src/config.c src/ramfix.c src/log.c ../bridges/hw/hw_backend.c -lpthread -lm -o $@
++	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -I../display/src -fsanitize=address,undefined tests/test_display_mode.c src/display.c src/config.c src/ramfix.c src/log.c ../display/src/xhd.c ../bridges/hw/hw_backend.c -lpthread -lm -o $@
+ # The image set (imageset.c) on stand-in files; ONEIOS_IMAGE_SET=DIR adds a real set's lists and trust caches.
+ $(H)/test_imageset: tests/test_imageset.c src/imageset.c $(HDR)
+ 	@mkdir -p $(H)
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index f363aed..9bf0854 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -36,6 +36,7 @@ void xh_config_defaults(xh_config *c)
+   strcpy(c->gpu, "auto");
+   c->input = true;
+   c->touch_sleep = true;
++  c->display_direct = -1;
+   c->tasks = true;
+   c->task_uid = -1;
+   c->log_level = XH_LOG_INFO;
+@@ -155,6 +156,7 @@ int xh_config_set(xh_config *c, const char *key, const char *value)
+   else if (!strcmp(key, "input-script")) return copy(c->input_script, sizeof c->input_script, value);
+   else if (!strcmp(key, "tasks")) return flag(value, &c->tasks);
+   else if (!strcmp(key, "task-uid")) c->task_uid = atoi(value);
++  else if (!strcmp(key, "display-direct")) { bool on; if (flag(value, &on)) return -1; c->display_direct = on; }
+   else if (!strcmp(key, "touch-sleep")) return flag(value, &c->touch_sleep);
+   else if (!strcmp(key, "pen")) { ok = !strcmp(value, "auto") || !strcmp(value, "off"); if (ok) strcpy(c->pen, value); }
+   else if (!strcmp(key, "pen-rotate")) { ok = !strcmp(value, "auto") || !strcmp(value, "0") || !strcmp(value, "90") || !strcmp(value, "180") || !strcmp(value, "270"); if (ok) strcpy(c->pen_rotate, value); }
+@@ -306,6 +308,7 @@ int xh_config_finish(xh_config *c)
+   if (!c->height) c->height = from_image.height;
+   if (!c->hz) c->hz = from_image.hz;
+   if (!c->display_format) c->display_format = from_image.display_format ? from_image.display_format : XH_PIXELS_BGRX8;
++  if (c->display_direct < 0) c->display_direct = from_image.display_direct < 0 ? 1 : from_image.display_direct;
+   // The KMS back end scans out 32-bit pixels: half floats only go to a display helper (shm) or nowhere.
+   if (c->display_format == XH_PIXELS_RGBA16F && !strcmp(c->display, "drm")) { fprintf(stderr, "xnuhost: display-format=rgba16f needs --display shm\n"); return -1; }
+   if (!c->scale) c->scale = from_image.scale ? from_image.scale : 3;
+diff --git a/runtime/xnuhost/src/display.c b/runtime/xnuhost/src/display.c
+index 1d6a00e..4b1644b 100644
+--- a/runtime/xnuhost/src/display.c
++++ b/runtime/xnuhost/src/display.c
+@@ -4,7 +4,9 @@
+ //         the memfd and the geometry, and is told of every changed rectangle. In a OneOS takeover
+ //         session One UI's surfaceflinger and composer keep running and hold the panel, so a root
+ //         SurfaceControl layer (OneOS's boot-status helper pattern) is the only way to the glass;
+-//         the helper owns that layer and copies from the memfd. This is the default.
++//         the helper owns that layer and copies from the memfd. This is the default. A helper that says it can
++//         ("direct", below) is given guest RAM read-only instead, and copies each frame of a blob scanout straight
++//         from the guest's pages into its layer's buffer: one copy a frame on the host, not two.
+ //   drm   Direct KMS scanout of a dumb buffer on /dev/dri/card0, for a session in which
+ //         surfaceflinger and the composer are stopped (xnuhost is then the DRM master).
+ //   none  The frame is kept in memory only (tests, headless bring-up).
+@@ -21,6 +23,7 @@
+ #include <sys/socket.h>
+ #include <sys/syscall.h>
+ #include <sys/un.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ static xh_display display;
+@@ -34,13 +37,239 @@ xh_display *xh_display_get(void) { return display.pixels ? &display : NULL; }
+ //          sRGB, 2: R,G,B,A half floats, linear extended sRGB (include/xnuhost/pixels.h, display-format=)
+ //   flush  { "XHDF", u32 x, u32 y, u32 w, u32 h }
+ // and from the helper, once, straight after it connects, whatever xnuhost does with it:
+-//   panel  { "XHDP", u32 width, u32 height, u32 hz, u32 0 }   the mode surfaceflinger runs the panel in
++//   panel  { "XHDP", u32 width, u32 height, u32 hz, u32 flags }  the mode surfaceflinger runs the panel in;
++//                                                               flags bit 0: the helper copies frames directly
++// The direct path, only to a helper that set that flag:
++//   memory { "XHDM", u32 RAM bytes low, high, u32 slots, u32 slot bytes } + the RAM memfd and the table memfd
++//   frame  { "XHDS", u32 slot, u32 seq low, u32 seq high, u32 0 }    the frame described in that slot of the table
++//   done   { "XHDA", u32 seq low, u32 seq high, u32 flags, 0 }  (helper -> xnuhost) every frame up to seq is in the
++//          layer; flags bit 0: the last one could not be copied from guest RAM (xnuhost copies the next ones itself)
++// A slot of the table: struct direct_slot, then nsegs { u64 RAM memfd offset, u64 length } in the scanout's order.
+ struct shm_message { char magic[4]; uint32_t a, b, c, d; };
+ static int shm_fd = -1, listen_fd = -1, client_fd = -1, first_client = -1;
++static uint32_t first_client_flags;
+ static pthread_mutex_t client_lock = PTHREAD_MUTEX_INITIALIZER;
+ static char socket_path[600];
+ 
+-static void helper_attach(int fd)
++// ---- direct frames ------------------------------------------------------------------------------
++// The frame's rows are the guest's own pages (the compositor's surface, which the guest scans out with
++// SET_SCANOUT_BLOB and flushes whole): the helper maps guest RAM read-only and copies them into the layer's buffer.
++// The guest's flush is answered when the helper says the frame is in the layer (virtio_gpu.c holds the reply), so
++// the guest does not draw into a surface the helper still reads; a helper that does not answer within
++// DIRECT_TIMEOUT_MS is answered for, so that a stuck helper costs frames but never the guest.
++#define DIRECT_SLOTS 4
++#define DIRECT_SEGS 16384                            // virtio_gpu.c MAX_BLOB_ENTRIES
++#define DIRECT_TIMEOUT_MS 100
++struct direct_slot { uint64_t seq, offset; uint32_t stride, width, height, nsegs, x, y, w, h, format, pad[3]; };
++struct direct_seg { uint64_t offset, length; };
++#define DIRECT_SLOT_BYTES (sizeof(struct direct_slot) + DIRECT_SEGS * sizeof(struct direct_seg))
++_Static_assert(sizeof(struct direct_slot) == 64, "the table's layout is the helper's too (runtime/display/src/xhd.h)");
++static bool direct_enabled = true, client_direct, client_memory;
++static int ram_fd = -1, table_fd = -1;
++static uint64_t ram_phys, ram_size, client_gen;
++static uint8_t *table;
++typedef struct { uint64_t seq; long long posted_us; xh_display_done done; void *opaque; } outstanding;
++static outstanding out[16];
++static unsigned nout;
++static struct { uint64_t frames, total_us, max_us, timeouts, copies; long long since_us; } stats;
++
++static long long now_us(void)
++{
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
++}
++
++// Takes the frames up to `seq` (all of them: UINT64_MAX; or those posted before `older_than_us`) off the list, with
++// client_lock held, into `done` for the caller to answer once the lock is let go.
++static unsigned take_done(uint64_t seq, long long older_than_us, outstanding *done, bool timed_out)
++{
++  unsigned n = 0, kept = 0;
++  long long now = now_us();
++  for (unsigned i = 0; i < nout; i++) {
++    bool take = older_than_us ? out[i].posted_us < older_than_us : out[i].seq <= seq;
++    if (!take) { out[kept++] = out[i]; continue; }
++    done[n++] = out[i];
++    if (timed_out) stats.timeouts++;
++    else {
++      uint64_t us = (uint64_t)(now - out[i].posted_us);
++      stats.frames++; stats.total_us += us;
++      if (us > stats.max_us) stats.max_us = us;
++    }
++  }
++  nout = kept;
++  return n;
++}
++
++static void answer(const outstanding *done, unsigned n)
++{
++  for (unsigned i = 0; i < n; i++) done[i].done(done[i].opaque, done[i].seq);
++}
++
++// With client_lock held. The RAM and the table go to a direct helper once the RAM is known (xh_display_set_ram).
++static void send_memory_locked(int fd)
++{
++  if (!client_direct || client_memory || ram_fd < 0 || table_fd < 0 || !direct_enabled) return;
++  struct ucred peer;
++  socklen_t peer_size = sizeof peer;
++  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) || peer_size != sizeof peer || peer.uid != geteuid()) {
++    client_direct = false;
++    LOGI("display: a helper with a different or unknown UID uses the frame buffer");
++    return;
++  }
++  struct shm_message m = { { 'X', 'H', 'D', 'M' }, (uint32_t)ram_size, (uint32_t)(ram_size >> 32), DIRECT_SLOTS, (uint32_t)DIRECT_SLOT_BYTES };
++  int fds[2] = { ram_fd, table_fd };
++  char control[CMSG_SPACE(sizeof fds)];
++  struct iovec iov = { &m, sizeof m };
++  struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control };
++  memset(control, 0, sizeof control);
++  struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
++  cm->cmsg_level = SOL_SOCKET;
++  cm->cmsg_type = SCM_RIGHTS;
++  cm->cmsg_len = CMSG_LEN(sizeof fds);
++  memcpy(CMSG_DATA(cm), fds, sizeof fds);
++  if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { LOGE("display: guest RAM could not be handed to the helper: %s", strerror(errno)); return; }
++  client_memory = true;
++  LOGI("display: the helper copies the guest's frames directly (guest RAM shared read-only, %llu MiB)", (unsigned long long)(ram_size >> 20));
++}
++
++static int read_only_fd(int fd)
++{
++  char path[40];
++  snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
++  return open(path, O_RDONLY | O_CLOEXEC);
++}
++
++void xh_display_set_ram(int fd, uint64_t phys, uint64_t size)
++{
++  if (backend != BACK_SHM || !direct_enabled) return;
++  size_t bytes = DIRECT_SLOTS * DIRECT_SLOT_BYTES;
++  int t = (int)syscall(SYS_memfd_create, "xnuhost-frames", 1u /* MFD_CLOEXEC */);
++  uint8_t *map = t >= 0 && !ftruncate(t, (off_t)bytes) ? mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, t, 0) : MAP_FAILED;
++  if (map == MAP_FAILED) { LOGE("display: no table for direct frames: %s", strerror(errno)); if (t >= 0) close(t); return; }
++  int ram_read = read_only_fd(fd);
++  int table_read = ram_read >= 0 ? read_only_fd(t) : -1;
++  int error = errno;
++  close(t);
++  if (table_read < 0) {
++    if (ram_read >= 0) close(ram_read);
++    munmap(map, bytes);
++    LOGI("display: read-only direct frames unavailable (%s); xnuhost keeps copying", strerror(error));
++    return;
++  }
++  pthread_mutex_lock(&client_lock);
++  ram_fd = ram_read; ram_phys = phys; ram_size = size; table_fd = table_read; table = map;
++  if (client_fd >= 0) send_memory_locked(client_fd);
++  pthread_mutex_unlock(&client_lock);
++}
++
++bool xh_display_direct(void)
++{
++  pthread_mutex_lock(&client_lock);
++  bool on = backend == BACK_SHM && client_fd >= 0 && client_direct && client_memory;
++  pthread_mutex_unlock(&client_lock);
++  return on;
++}
++
++int xh_display_post(const xh_gpu_entry *entries, unsigned n, uint64_t offset, uint32_t stride, uint32_t width, uint32_t height,
++                    uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t seq, xh_display_done done, void *opaque)
++{
++  outstanding over[16];
++  unsigned nover = 0;
++  int result = -1;
++  pthread_mutex_lock(&client_lock);
++  if (backend != BACK_SHM || client_fd < 0 || !client_direct || !client_memory || !table) goto out;
++  struct direct_slot *slot = (struct direct_slot *)(table + (seq % DIRECT_SLOTS) * DIRECT_SLOT_BYTES);
++  struct direct_seg *segs = (struct direct_seg *)(slot + 1);
++  unsigned count = 0;
++  for (unsigned i = 0; i < n; i++) {
++    uint64_t pa = entries[i].addr, len = entries[i].length;
++    if (pa < ram_phys || len > ram_size || pa - ram_phys > ram_size - len) goto out;      // not RAM: the copy here instead
++    uint64_t at = pa - ram_phys;
++    if (count && segs[count - 1].offset + segs[count - 1].length == at) { segs[count - 1].length += len; continue; }
++    if (count == DIRECT_SEGS) goto out;
++    segs[count++] = (struct direct_seg){ at, len };
++  }
++  *slot = (struct direct_slot){ .seq = 0, .offset = offset, .stride = stride, .width = width, .height = height, .nsegs = count,
++                                .x = x, .y = y, .w = w, .h = h, .format = 1 };
++  __atomic_store_n(&slot->seq, seq, __ATOMIC_RELEASE);
++  if (nout == sizeof out / sizeof *out) nover = take_done(out[0].seq, 0, over, true);  // the oldest, unanswered
++  struct shm_message m = { { 'X', 'H', 'D', 'S' }, (uint32_t)(seq % DIRECT_SLOTS), (uint32_t)seq, (uint32_t)(seq >> 32), 0 };
++  if (send(client_fd, &m, sizeof m, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) goto out;
++  out[nout++] = (outstanding){ seq, now_us(), done, opaque };
++  result = 0;
++out:
++  pthread_mutex_unlock(&client_lock);
++  answer(over, nover);
++  return result;
++}
++
++// One per helper: reads its messages (the late panel report that says it is direct, the frames it has shown), answers
++// for frames it took too long over, and when it goes, for all of them.
++typedef struct { int fd; uint64_t gen; } reader_arg;
++static void *reader_main(void *arg)
++{
++  reader_arg r = *(reader_arg *)arg;
++  free(arg);
++  outstanding done[16];
++  for (;;) {
++    pthread_mutex_lock(&client_lock);
++    bool current = r.gen == client_gen, waiting = nout > 0;
++    pthread_mutex_unlock(&client_lock);
++    if (!current) break;
++    struct pollfd p = { r.fd, POLLIN, 0 };
++    int ready = poll(&p, 1, waiting ? 10 : 200);
++    if (ready < 0 && errno != EINTR) break;
++    unsigned n = 0;
++    bool gone = false;
++    if (ready > 0) {
++      struct shm_message m;
++      ssize_t got = recv(r.fd, &m, sizeof m, MSG_DONTWAIT);
++      if (got == 0 || (got < 0 && errno != EAGAIN && errno != EINTR)) gone = true;
++      else if (got == (ssize_t)sizeof m && !memcmp(m.magic, "XHDA", 4)) {
++        pthread_mutex_lock(&client_lock);
++        n = take_done((uint64_t)m.a | (uint64_t)m.b << 32, 0, done, false);
++        bool off = (m.c & 1) && r.gen == client_gen && client_direct;
++        if (off) client_direct = false;
++        pthread_mutex_unlock(&client_lock);
++        if (off) LOGE("display: the helper could not copy a frame from guest RAM; xnuhost copies the frames again");
++      } else if (got == (ssize_t)sizeof m && !memcmp(m.magic, "XHDP", 4) && (m.d & 1)) {
++        pthread_mutex_lock(&client_lock);
++        if (r.gen == client_gen && !client_direct) { client_direct = true; send_memory_locked(r.fd); }
++        pthread_mutex_unlock(&client_lock);
++      }
++    }
++    if (gone) break;
++    answer(done, n);
++    long long now = now_us();
++    pthread_mutex_lock(&client_lock);
++    n = take_done(0, now - DIRECT_TIMEOUT_MS * 1000ll, done, true);
++    bool report = now - stats.since_us >= 10000000ll;
++    uint64_t frames = stats.frames, total = stats.total_us, max = stats.max_us, timeouts = stats.timeouts, copies = stats.copies;
++    if (report) { memset(&stats, 0, sizeof stats); stats.since_us = now; }
++    pthread_mutex_unlock(&client_lock);
++    answer(done, n);
++    if (report && (frames || timeouts || copies))
++      LOGI("display: 10 s: %llu frames copied by the helper from guest RAM (posted to in the layer: mean %.1f ms, max %.1f ms), "
++           "%llu not answered within %d ms, %llu flushes of xnuhost's own copy", (unsigned long long)frames,
++           frames ? total / 1000.0 / frames : 0.0, max / 1000.0, (unsigned long long)timeouts, DIRECT_TIMEOUT_MS, (unsigned long long)copies);
++  }
++  // The helper is gone or another one took over: what it was shown is answered for.
++  // (A helper that took over has had the frames already: helper_attach answered for them, and later ones are its own.)
++  pthread_mutex_lock(&client_lock);
++  unsigned n = 0;
++  if (r.gen == client_gen) {
++    n = take_done(UINT64_MAX, 0, done, true);
++    if (client_fd >= 0) close(client_fd);
++    client_fd = -1; client_gen++; client_direct = client_memory = false;
++  }
++  pthread_mutex_unlock(&client_lock);
++  answer(done, n);
++  close(r.fd);
++  return NULL;
++}
++
++static void helper_attach(int fd, uint32_t flags)
+ {
+   struct shm_message hello = { { 'X', 'H', 'D', '1' }, display.width, display.height, display.stride, display.format };
+   char control[CMSG_SPACE(sizeof(int))];
+@@ -53,11 +282,26 @@ static void helper_attach(int fd)
+   cm->cmsg_len = CMSG_LEN(sizeof(int));
+   memcpy(CMSG_DATA(cm), &shm_fd, sizeof(int));
+   if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { close(fd); return; }
++  reader_arg *r = malloc(sizeof *r);
++  outstanding done[16];
+   pthread_mutex_lock(&client_lock);
+   if (client_fd >= 0) close(client_fd);          // the newest helper wins
++  unsigned n = take_done(UINT64_MAX, 0, done, true);   // the last one's frames: it will not answer for them now
+   client_fd = fd;
++  client_gen++;
++  client_direct = direct_enabled && (flags & 1);
++  client_memory = false;
++  send_memory_locked(fd);
++  pthread_t thread;
++  if (r) { r->fd = dup(fd); r->gen = client_gen; }
++  if (!r || r->fd < 0 || pthread_create(&thread, NULL, reader_main, r)) {
++    if (r && r->fd >= 0) close(r->fd);
++    free(r);
++    client_direct = false;                           // nobody would read its answers
++  } else pthread_detach(thread);
+   pthread_mutex_unlock(&client_lock);
+-  LOGI("display: a helper connected");
++  answer(done, n);
++  LOGI("display: a helper connected%s", client_direct ? " (it copies frames directly)" : "");
+   xh_display_flush(0, 0, display.width, display.height);
+ }
+ 
+@@ -67,7 +311,7 @@ static void *accept_main(void *arg)
+   for (;;) {
+     int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+     if (fd < 0) { if (errno == EINTR) continue; return NULL; }
+-    helper_attach(fd);
++    helper_attach(fd, 0);                           // a later report says whether it is direct (reader_main)
+   }
+ }
+ 
+@@ -110,7 +354,7 @@ static bool helper_report(xh_panel_mode *panel)
+   if (wait_readable(first_client, HELPER_REPORT_MS) <= 0) { LOGI("display: the helper did not report the panel's mode"); return false; }
+   struct shm_message m;
+   ssize_t n = recv(first_client, &m, sizeof m, MSG_DONTWAIT);
+-  if (n >= 0 && xh_panel_report(&m, (size_t)n, panel)) return true;
++  if (n >= 0 && xh_panel_report(&m, (size_t)n, panel)) { first_client_flags = m.d; return true; }
+   LOGI("display: the helper's report of the panel's mode was not usable");
+   return false;
+ }
+@@ -122,7 +366,7 @@ static int shm_frame(void)
+   if (shm_fd < 0 || ftruncate(shm_fd, (off_t)bytes)) return -1;
+   display.pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+   if (display.pixels == MAP_FAILED) { display.pixels = NULL; return -1; }
+-  if (first_client >= 0) { helper_attach(first_client); first_client = -1; }
++  if (first_client >= 0) { helper_attach(first_client, first_client_flags); first_client = -1; }
+   if (listen_fd < 0) return 0;
+   pthread_t thread;
+   return pthread_create(&thread, NULL, accept_main, NULL) ? -1 : 0;
+@@ -227,6 +471,7 @@ static bool panel_native(xh_panel_mode *native) { (void)native; return false; }
+ 
+ int xh_display_init(const xh_config *c, unsigned *width, unsigned *height, unsigned *hz)
+ {
++  direct_enabled = c->display_direct;
+   backend = !strcmp(c->display, "drm") ? BACK_DRM : !strcmp(c->display, "shm") ? BACK_SHM : BACK_NONE;
+   if (backend == BACK_DRM && drm_init()) return -1;
+   if (backend == BACK_SHM && shm_listen(c)) return -1;
+@@ -274,6 +519,7 @@ void xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h)
+   if (backend == BACK_DRM) drm_flush(x, y, w, h);
+   if (backend != BACK_SHM) return;
+   pthread_mutex_lock(&client_lock);
++  stats.copies++;
+   if (client_fd >= 0) {
+     struct shm_message m = { { 'X', 'H', 'D', 'F' }, x, y, w, h };
+     // Only a helper that is gone loses its socket. A full queue (EAGAIN) or a passing shortage (ENOBUFS, ENOMEM)
+@@ -282,7 +528,7 @@ void xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h)
+     if (send(client_fd, &m, sizeof m, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 && errno != EAGAIN && errno != EINTR) {
+       if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
+         LOGI("display: the helper's socket is gone (%s): closed", strerror(errno));
+-        close(client_fd); client_fd = -1;
++        close(client_fd); client_fd = -1; client_gen++; client_direct = client_memory = false;    // its reader answers for its frames
+       } else {
+         static unsigned dropped;
+         if (dropped++ % 1000 == 0) LOGI("display: a flush to the helper failed (%s): dropped, the socket kept (%u so far)", strerror(errno), dropped);
+@@ -295,6 +541,12 @@ void xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h)
+ void xh_display_close(void)
+ {
+   if (listen_fd >= 0) { close(listen_fd); unlink(socket_path); }
++  pthread_mutex_lock(&client_lock);
++  if (ram_fd >= 0) { close(ram_fd); ram_fd = -1; }
++  if (table_fd >= 0) { close(table_fd); table_fd = -1; }
++  if (table) { munmap(table, DIRECT_SLOTS * DIRECT_SLOT_BYTES); table = NULL; }
++  client_memory = false;
++  pthread_mutex_unlock(&client_lock);
+ #if defined(__linux__) && __has_include(<drm/drm.h>)
+   if (drm_fd >= 0) { ioctl(drm_fd, DRM_IOCTL_DROP_MASTER, 0); close(drm_fd); }
+ #endif
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 66b027b..78af75b 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -587,6 +587,7 @@ static int boot(void)
+   uint64_t phys = g_mem.phys;                       // physical = where it is mapped (mem.c)
+   uint64_t media_pool_pa = phys + window + pool_bytes;              // after the GPU pool, before the framebuffer
+   boot_fb_pa = phys + window + pool_bytes + media_bytes;
++  xh_display_set_ram(g_mem.fd, phys, g_mem.size);
+   if (xh_mem_kva() == 0) { g_info.kva_base = g_mem.kva; g_info.kva_size = g_mem.kva_size; }
+   LOGI("memory: %llu MiB at 0x%llx, physical = virtual (slide 0x%llx); I/O aperture 0x%llx",
+        (unsigned long long)(window >> 20), (unsigned long long)phys,
+diff --git a/runtime/xnuhost/src/virtio_gpu.c b/runtime/xnuhost/src/virtio_gpu.c
+index 07bc5eb..533d842 100644
+--- a/runtime/xnuhost/src/virtio_gpu.c
++++ b/runtime/xnuhost/src/virtio_gpu.c
+@@ -101,6 +101,11 @@ typedef struct {
+   // figures (blob_note). Set where the worker changes the table.
+   uint64_t blob_bytes, blobs_made, blobs_unref, blob_note_us, noted_made, noted_unref;
+   struct { uint32_t width, height, format, stride, offset; } scan;      // the scanout when it is a blob
++  // A flush of the blob scanout handed to the display helper (xh_display_post): set by flush_blob, posted by work()
++  // once the command's reply is held on `fences` as the display's (ctx 0, which no context has), and answered when
++  // the helper has the frame in its layer.
++  struct { bool on; const blob *b; gpu_rect rect; uint64_t seq; } post;
++  uint64_t display_seq;
+   pthread_mutex_t pl;
+   pthread_cond_t idle;
+   pending *fences;
+@@ -281,7 +286,43 @@ static void flush_note(uint64_t took, uint64_t bytes)
+   }
+ }
+ 
+-// RESOURCE_FLUSH of a blob: when it is the scanout (SET_SCANOUT_BLOB), its rows go from the guest's pages to the display.
++// Copies `length` bytes at linear `offset` of a guest blob into `out`.
++static bool blob_read(const blob *b, uint64_t offset, uint8_t *out, uint64_t length)
++{
++  for (unsigned i = 0; i < b->nentries && length; i++) {
++    uint64_t size = b->entries[i].length;
++    if (offset >= size) { offset -= size; continue; }
++    uint64_t n = size - offset < length ? size - offset : length;
++    const uint8_t *p = xh_virtio_translate(b->entries[i].addr + offset, n);
++    if (!p) return false;
++    memcpy(out, p, n);
++    out += n; length -= n; offset = 0;
++  }
++  return length == 0;
++}
++
++// The rows of a blob scanout's rectangle (clipped to the display) into xnuhost's frame, then the helper is told.
++// B,G,R,X/A (the guest's display driver's format) goes straight from the guest's pages into the frame.
++static uint32_t flush_copy(gpu_state *g, const blob *b, const gpu_rect *rect)
++{
++  xh_display *d = xh_display_get();
++  if (!d || !d->pixels) return RESP_OK_NODATA;
++  bool same = g->scan.format == FMT_BGRX || g->scan.format == FMT_BGRA;
++  uint8_t *row = same ? NULL : malloc((size_t)rect->w * 4 + 4);
++  if (!same && !row) return RESP_ERR_OUT_OF_MEMORY;
++  uint32_t status = RESP_OK_NODATA;
++  for (uint32_t y = 0; y < rect->h && rect->w; y++) {
++    uint8_t *to = d->pixels + (size_t)(rect->y + y) * d->stride + (size_t)rect->x * 4;
++    if (!blob_read(b, g->scan.offset + (uint64_t)(rect->y + y) * g->scan.stride + (uint64_t)rect->x * 4, same ? to : row, (uint64_t)rect->w * 4)) { status = RESP_ERR_INVALID_PARAMETER; break; }
++    if (!same) convert(to, row, g->scan.format, rect->w);
++  }
++  free(row);
++  if (status == RESP_OK_NODATA && rect->w && rect->h) xh_display_flush(rect->x, rect->y, rect->w, rect->h);
++  return status;
++}
++
++// RESOURCE_FLUSH of a blob: when it is the scanout (SET_SCANOUT_BLOB), its rows go from the guest's pages to the display:
++// handed to a helper that copies them itself (work() posts it), else copied here.
+ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
+ {
+   xh_display *d = xh_display_get();
+@@ -289,6 +330,14 @@ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
+   if (!rect_ok(rect, g->scan.width, g->scan.height)) return RESP_ERR_INVALID_PARAMETER;
+   uint32_t w = rect->x < d->width ? (rect->w < d->width - rect->x ? rect->w : d->width - rect->x) : 0;
+   uint32_t hgt = rect->y < d->height ? (rect->h < d->height - rect->y ? rect->h : d->height - rect->y) : 0;
++  if (!w || !hgt) return RESP_OK_NODATA;
++  gpu_rect clipped = { rect->x, rect->y, w, hgt };
++  // The ready probe reads the host's buffer and the helper waits for ready before posting.
++  // Keep copying there until the first guest frame passes that probe.
++  if (g->first_frame && g->b && (g->scan.format == FMT_BGRX || g->scan.format == FMT_BGRA) && xh_display_direct()) {
++    g->post.on = true; g->post.b = b; g->post.rect = clipped; g->post.seq = ++g->display_seq;
++    return RESP_OK_NODATA;
++  }
+   // Rows straight from the guest's pages into the display's buffer, the blob's segments walked once for the whole
+   // rectangle: rows lie at rising offsets. (Each row used to be read into a buffer of its own, the segment list searched
+   // from its start for every row: 3120 rows of a 1440x3120 frame over about 1100 segments of 16 KiB pages.)
+@@ -365,6 +414,9 @@ static void gpu_retire(xh_virtio *dev, uint32_t ctx, uint32_t ring, uint64_t fen
+   retire(xh_virtio_opaque(dev), ctx, (int)ring, fence);
+ }
+ 
++// The display helper has a posted frame in its layer (or it was given up on): its flush goes back to the guest.
++static void display_done(void *opaque, uint64_t seq) { retire(opaque, 0, 0, seq); }
++
+ // The 3D commands and the blob ones. 0: not one of them (command() goes on to the 2D ones).
+ static uint32_t command3d(gpu_state *g, const gpu_hdr *h, const uint8_t *body, size_t left, uint8_t *resp, size_t resp_max, size_t *resp_size)
+ {
+@@ -791,8 +843,26 @@ static uint32_t work(gpu_state *g, uint16_t head, xh_viov *iov, unsigned n, uint
+   // the device's own ring has nothing to wait for: the 2D commands are done when they return).
+   bool hold = written > 0 && status < RESP_ERR_UNSPEC && (in.flags & FLAG_FENCE) && (in.flags & FLAG_RING_IDX) && ctx_find(g, in.ctx);
+   pending *p = calloc(1, sizeof *p);
+-  if (!p) return status;                             // the chain is lost; so is the guest's command
++  if (!p) { g->post.on = false; return status; }                       // the chain is lost; so is the guest's command
+   *p = (pending){ .head = head, .written = (uint32_t)written, .ctx = in.ctx, .ring = in.ring, .fence = in.fence, .gen = gen };
++  if (g->post.on) {
++    // A frame for the helper: its flush is answered when the helper has it in the layer. Held before it is posted,
++    // since the answer may come first. Not posted after all (the helper went): copied here, answered now.
++    g->post.on = false;
++    p->ctx = 0; p->ring = 0; p->fence = g->post.seq;
++    pthread_mutex_lock(&g->pl);
++    p->next = g->fences;
++    g->fences = p;
++    pthread_mutex_unlock(&g->pl);
++    const blob *b = g->post.b;
++    const gpu_rect *r = &g->post.rect;
++    if (xh_display_post(b->entries, b->nentries, g->scan.offset, g->scan.stride, g->scan.width, g->scan.height, r->x, r->y, r->w, r->h,
++                        g->post.seq, display_done, g)) {
++      flush_copy(g, b, r);
++      retire(g, 0, 0, g->post.seq);
++    }
++    return status;
++  }
+   if (!hold) { push_pending(g, p); return status; }
+   pthread_mutex_lock(&g->pl);
+   p->next = g->fences;
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index 6939922..dc7eb97 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -11,6 +11,7 @@
+ #include <sys/types.h>
+ #include "xnuhost/hostcall.h"
+ #include "xnuhost/pixels.h"
++#include "gpu3d.h"
+ #include "bridges/hw_backend.h"     // br_hw_settings: hw-backend, hw-backend-<bridge>, hw-backend-fallback (runtime/bridges)
+ 
+ #define XH_MAX_CPUS 8
+@@ -85,6 +86,7 @@ typedef struct {
+   unsigned ndisk;
+   char  display[16];        // "shm", "drm", "none"
+   unsigned display_format;  // display-format=: the frame's pixels, XH_PIXELS_BGRX8 ("bgrx", the default) or XH_PIXELS_RGBA16F
++  int   display_direct;     // 1: let a compatible helper read guest frames; 0: host copy; -1: unset
+                             // ("rgba16f": half floats, wide colour and EDR kept; the guest is told oneios-display-wide=1)
+   char  gpu[8];             // "auto" (3D when the host has KGSL, udmabuf and a dma heap), "3d" (or do not start), "2d"
+   char  gpu_level[12];      // gpu-level=: "deadline" (default: the top level only for frames that would miss), "hold" (every
+@@ -634,6 +636,13 @@ int   xh_display_init(const xh_config *c, unsigned *width, unsigned *height, uns
+ xh_display *xh_display_get(void);
+ // The rectangle changed (already copied into pixels).
+ void  xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h);
++// Share the RAM memfd and its guest physical base with a compatible display helper.
++void  xh_display_set_ram(int fd, uint64_t phys, uint64_t size);
++bool  xh_display_direct(void);
++// On success, done is called once when the frame is posted or given up on. A failure leaves the caller to copy it.
++typedef void (*xh_display_done)(void *opaque, uint64_t seq);
++int   xh_display_post(const xh_gpu_entry *entries, unsigned n, uint64_t offset, uint32_t stride, uint32_t width, uint32_t height,
++                      uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t seq, xh_display_done done, void *opaque);
+ void  xh_display_close(void);
+ 
+ // Input (input.c): /dev/input/event* into the virtio-input device; with `pen` (NULL: none) the pen's device too, read on
+diff --git a/runtime/xnuhost/tests/test_display_mode.c b/runtime/xnuhost/tests/test_display_mode.c
+index 8bf9183..bd415a4 100644
+--- a/runtime/xnuhost/tests/test_display_mode.c
++++ b/runtime/xnuhost/tests/test_display_mode.c
+@@ -2,6 +2,11 @@
+ // The real display.c against a stand-in helper on the real socket: where the guest's mode comes from.
+ #define _GNU_SOURCE
+ #include "xnuhost.h"
++#include "xhd.h"
++#include <fcntl.h>
++#include <stdatomic.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -72,6 +77,88 @@ static int run(const char *dir, const char *mode, unsigned cw, unsigned ch, unsi
+   _exit(0);
+ }
+ 
++// Direct frames, the helper being the display helper's own xhd.c: it says it is direct, gets guest RAM and the table,
++// copies a frame from scattered guest pages and answers; one that never answers is answered for.
++#define RAM_PA 0x800000000ull
++#define RAM_BYTES 0x40000u
++enum { DW = 16, DH = 40, DSTRIDE = 80 };
++static struct { char path[300]; int answer; atomic_int copied, ok; uint64_t seq; } dh;
++static uint8_t *ram_map;
++
++static void *direct_helper(void *arg)
++{
++  (void)arg;
++  int fd = xhd_connect(dh.path, 3000, NULL);
++  struct xhd_frame frame;
++  if (fd < 0 || xhd_send_panel(fd, DW, DH, 120, XHD_PANEL_DIRECT) || xhd_recv_hello(fd, &frame, 3000)) return NULL;
++  struct xhd_direct d;
++  xhd_direct_init(&d);
++  struct xhd_rect damage = { 0, 0, 0, 0 };
++  for (int i = 0; i < 300 && !d.pending; i++) { if (xhd_drain_direct(fd, &frame, &damage, &d) < 0) break; usleep(10000); }
++  if (d.pending) {
++    static uint8_t dst[DW * 4 * DH];
++    struct xhd_rect done;
++    int ram_flags = fcntl(d.ram_fd, F_GETFL), table_flags = fcntl(d.table_fd, F_GETFL);
++    int ok = ram_flags >= 0 && (ram_flags & O_ACCMODE) == O_RDONLY &&
++             table_flags >= 0 && (table_flags & O_ACCMODE) == O_RDONLY &&
++             xhd_copy_direct(&d, dst, DW * 4, DW, DH, 0, NULL, &done) == 0 && done.w == DW && done.h == DH;
++    // the guest's frame: rows of DSTRIDE bytes over pages 3, 1 and 2 of its RAM (4 KiB each), in that order
++    for (uint32_t y = 0; y < DH && ok; y++) for (uint32_t x = 0; x < DW * 4; x++) {
++      uint64_t at = (uint64_t)y * DSTRIDE + x, page = at / 4096 == 0 ? 3 : at / 4096 == 1 ? 1 : 2;
++      if (dst[y * DW * 4 + x] != ram_map[page * 4096 + at % 4096]) ok = 0;
++    }
++    dh.ok = ok;
++    dh.seq = d.seq;
++    dh.copied = 1;
++    if (dh.answer) xhd_send_done(fd, d.seq, dh.answer == 2 ? XHD_DONE_FAILED : 0);
++  }
++  usleep(400000);                                     // still connected while xnuhost waits (or gives up)
++  xhd_direct_close(&d);
++  xhd_frame_close(&frame);
++  close(fd);
++  return NULL;
++}
++
++static atomic_int answered;
++static atomic_ullong answered_seq;
++static void on_done(void *opaque, uint64_t seq) { (void)opaque; answered_seq = seq; answered++; }
++
++static int run_direct(const char *dir, int answer)
++{
++  pid_t child = fork();
++  if (child) { int status = 1; waitpid(child, &status, 0); return WIFEXITED(status) ? WEXITSTATUS(status) : 99; }
++  xh_config c;
++  xh_config_defaults(&c);
++  strcpy(c.mode, "takeover");
++  strcpy(c.session, dir);
++  c.scale = 3; c.width = DW; c.height = DH; c.hz = 120;                 // pinned: the report comes later, to the reader
++  snprintf(dh.path, sizeof dh.path, "%s/display.sock", dir);
++  dh.answer = answer;
++  int ram = (int)syscall(SYS_memfd_create, "test-ram", 0u);
++  if (ram < 0 || ftruncate(ram, RAM_BYTES)) _exit(2);
++  ram_map = mmap(NULL, RAM_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, ram, 0);
++  for (unsigned i = 0; i < RAM_BYTES; i++) ram_map[i] = (uint8_t)(i * 7 + i / 4096);
++  unsigned w, h, hz;
++  if (xh_display_init(&c, &w, &h, &hz)) _exit(2);
++  pthread_t thread;
++  pthread_create(&thread, NULL, direct_helper, NULL);
++  xh_display_set_ram(ram, RAM_PA, RAM_BYTES);
++  for (int i = 0; i < 300 && !xh_display_direct(); i++) usleep(10000);
++  if (!xh_display_direct()) _exit(3);
++  const xh_gpu_entry segs[] = { { RAM_PA + 0x3000, 0x1000, 0 }, { RAM_PA + 0x1000, 0x2000, 0 } };   // pages 3, then 1 and 2
++  const xh_gpu_entry outside[] = { { RAM_PA + RAM_BYTES, 0x1000, 0 } };
++  if (xh_display_post(outside, 1, 0, DSTRIDE, DW, DH, 0, 0, DW, DH, 1, on_done, NULL) != -1) _exit(4);   // not RAM: not posted
++  if (xh_display_post(segs, 2, 0, DSTRIDE, DW, DH, 0, 0, DW, DH, 2, on_done, NULL)) _exit(5);
++  for (int i = 0; i < 300 && !answered; i++) usleep(10000);
++  if (!answered || answered_seq != 2 || !dh.copied || !dh.ok || dh.seq != 2) _exit(6);
++  if (answer == 2) {                                   // it said it could not copy: xnuhost copies again
++    for (int i = 0; i < 100 && xh_display_direct(); i++) usleep(10000);
++    if (xh_display_direct()) _exit(7);
++  }
++  pthread_join(thread, NULL);
++  _exit(0);
++}
++
+ int main(void)
+ {
+   char dir[] = "/tmp/xnuhost-display-XXXXXX";
+@@ -85,6 +172,12 @@ int main(void)
+   report_w = 1440; report_h = 3120; report_hz = 120;
+   CASE("a configured mode wins, without waiting", "takeover", 1080, 2340, 60, 1080, 2340, 60, 1.0);
+   CASE("a bench run assumes the S24 Ultra's, without waiting", "bench", 0, 0, 0, 1440, 3120, 120, 1.0);
++  r = run_direct(dir, 1);
++  printf("direct frames: the helper copies from guest RAM and answers: %s (%d)\n", r ? "FAILED" : "ok", r); failures += r != 0;
++  r = run_direct(dir, 2);
++  printf("direct frames: a helper that could not copy one turns them off: %s (%d)\n", r ? "FAILED" : "ok", r); failures += r != 0;
++  r = run_direct(dir, 0);
++  printf("direct frames: a helper that never answers is answered for: %s (%d)\n", r ? "FAILED" : "ok", r); failures += r != 0;
+   char command[100];
+   snprintf(command, sizeof command, "rm -rf %s", dir);
+   if (system(command)) failures++;
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 90eae4c..9f75748 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -45,6 +45,21 @@ static xh_display fake_display;
+ static unsigned flush_rect[4];
+ xh_display *xh_display_get(void) { return fake_display.pixels ? &fake_display : NULL; }
+ void xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h) { flush_rect[0] = x; flush_rect[1] = y; flush_rect[2] = w; flush_rect[3] = h; flushes++; }
++// A display helper that copies frames itself (display.c's direct path): what it was handed, and its answer.
++static bool fake_direct, fake_refuse;
++static struct { xh_gpu_entry entries[4]; unsigned n, posts; uint64_t offset, seq; uint32_t stride, width, height, x, y, w, h; xh_display_done done; void *opaque; } fake_post;
++void xh_display_set_ram(int fd, uint64_t phys, uint64_t size) { (void)fd; (void)phys; (void)size; }
++bool xh_display_direct(void) { return fake_direct; }
++int xh_display_post(const xh_gpu_entry *entries, unsigned n, uint64_t offset, uint32_t stride, uint32_t width, uint32_t height,
++                    uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t seq, xh_display_done done, void *opaque)
++{
++  if (fake_refuse) return -1;
++  fake_post.n = n; memcpy(fake_post.entries, entries, (n < 4 ? n : 4) * sizeof *entries);
++  fake_post.offset = offset; fake_post.stride = stride; fake_post.width = width; fake_post.height = height;
++  fake_post.x = x; fake_post.y = y; fake_post.w = w; fake_post.h = h; fake_post.seq = seq; fake_post.done = done; fake_post.opaque = opaque;
++  fake_post.posts++;
++  return 0;
++}
+ unsigned xh_task_filter(struct xs_filter_insn *f, uint64_t text_lo, uint64_t text_hi, int ram_fd, int trap_fd);
+ 
+ // ---- instructions -------------------------------------------------------------------------------
+@@ -833,6 +848,28 @@ static void test_virtio_gpu3d(void)
+   CHECK(flush_rect[0] == 1 && flush_rect[1] == 2 && flush_rect[2] == 3 && flush_rect[3] == 2);
+   const uint8_t *px = fake_display.pixels + 2 * 32 + 1 * 4;
+   CHECK(px[0] == 21 && px[1] == 0x20 && px[2] == 0x10 && fake_display.pixels[3 * 32 + 3 * 4] == 33 && fake_display.pixels[0] == 0 && fake_display.pixels[2 * 32 + 4 * 4] == 0);
++  // a helper that copies the frame itself: the flush is handed over, not copied here, and answered when it says so
++  fake_direct = true;
++  memset(fake_display.pixels, 0, 4 * 32);
++  flush_rect[2] = 0;
++  CLEAR(); cmd[0] = 0x104; cmd[6] = 0; cmd[7] = 1; cmd[8] = 8; cmd[9] = 3; cmd[10] = 20;                 // (0,1) 8x3
++  CHECK(G(12, 24) == 0 && fake_post.posts == 1 && flush_rect[2] == 0 && fake_display.pixels[1 * 32] == 0);
++  CHECK(fake_post.n == 1 && fake_post.entries[0].addr == GUEST_PA + 0x40000 && fake_post.stride == 40 && fake_post.offset == 0);
++  CHECK(fake_post.width == 8 && fake_post.height == 4 && fake_post.x == 0 && fake_post.y == 1 && fake_post.w == 8 && fake_post.h == 3);
++  uint64_t first_seq = fake_post.seq;
++  CLEAR(); cmd[0] = 0x104; cmd[8] = 8; cmd[9] = 4; cmd[10] = 20;
++  CHECK(G(12, 24) == 0 && fake_post.posts == 2 && fake_post.seq == first_seq + 1);                       // a second one, held too
++  fake_post.done(fake_post.opaque, first_seq);
++  CHECK((uint16_t)(used[1] - d.used_seen[0]) == 1);                                                       // the first answered
++  fake_post.done(fake_post.opaque, fake_post.seq);
++  CHECK((uint16_t)(used[1] - d.used_seen[0]) == 2 && resp[0] == 0x1100);
++  d.used_seen[0] = used[1];
++  fake_post.done(fake_post.opaque, fake_post.seq);                                                         // twice: nothing
++  CHECK(used[1] == d.used_seen[0]);
++  fake_refuse = true;                                                                                      // the helper went: copied here
++  CLEAR(); cmd[0] = 0x104; cmd[8] = 8; cmd[9] = 4; cmd[10] = 20;
++  CHECK(G(12, 24) == 1 && resp[0] == 0x1100 && flush_rect[2] == 8 && fake_display.pixels[3 * 32 + 3 * 4] == 33);
++  fake_direct = fake_refuse = false;
+   {
+     // Half floats (display-format=rgba16f, oneios-display-wide=1): a 'RGhA' scanout's rows go to a half-float display as
+     // they are, and a B,G,R,X one is decoded to linear light; onto the 8-bit display half floats are encoded and clamped.
