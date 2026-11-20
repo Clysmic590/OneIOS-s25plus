@@ -1,0 +1,41 @@
+name: Publish OneiOS runtime 0.1.26
+on:
+  push:
+    branches: [publish/runtime-0.1.26]
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify the existing build and publish its runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          archive=oneios-build.zip
+          curl --fail --silent --show-error --location --retry 2 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/14670742287/zip" \
+            --output "$archive"
+          printf '%s  %s\n' d53997208ab213592614426eca384c3598740fa602ed89686ae6a4be4e2013b9 "$archive" | sha256sum --check
+          runtime=oneios-runtime-0.1.26-s25plusmetal-arm64.tar.zst
+          unzip -p "$archive" "$runtime" > "$runtime"
+          unzip -p "$archive" "$runtime.sha256" > "$runtime.sha256"
+          printf '%s  %s\n' bf74552afe480e22e630a80f5f3d47e970b27471d5f4907fba4c7c650eaceced "$runtime" | sha256sum --check
+          printf '%s  %s\n' bf74552afe480e22e630a80f5f3d47e970b27471d5f4907fba4c7c650eaceced "$runtime" > "$runtime.sha256"
+          cat > release-notes.md <<'NOTES'
+          OneiOS 0.1.26-s25plusmetal is a test runtime for the Galaxy S25 series. It defers brightness updates received while the display is off until wake, applies the 24A446 panel brightness fix across graphics modes, logs failed brightness writes, and enables built-in side-button routing for the S25, S25+, and S25 Ultra.
+          
+          Import the .tar.zst file in OneOS. The APK and iOS image are separate. The local brightness and input checks and GitHub build passed. On-device brightness and lock/wake verification is still pending.
+          
+          Credits: [OneiOS](https://github.com/akshaynexus/OneiOS), [UniXNU](https://github.com/UniXNU/UniXNU), [metal2vulkan](https://github.com/steelbrain/metal2vulkan), and [Mesa Turnip](https://mesa3d.org/). [Build and checks](https://github.com/Clysmic590/OneIOS-s25plus/actions/runs/44819784204).
+          NOTES
+          gh release create oneios-runtime-0.1.26-s25plusmetal "$runtime" "$runtime.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target ddb136931d9888bd9bb7523d079461b505c2c42e \
+            --title "OneiOS runtime 0.1.26 for Galaxy S25 series" --prerelease --latest=false \
+            --notes-file release-notes.md
