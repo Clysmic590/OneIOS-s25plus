@@ -88,13 +88,13 @@ jobs:
         env:
           ONEIOS_BUILD_AEA: '1'
           PACKAGE_EXTRA_DIR: ${{ github.workspace }}/metal-stage
-        run: bash runtime/package.sh 0.1.23-s25plusmetal
+        run: bash runtime/package.sh 0.1.24-s25plusmetal
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Metal-Runtime-0.1.23
+          name: OneiOS-S25Plus-Metal-Runtime-0.1.24
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.23-s25plusmetal-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.23-s25plusmetal-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.24-s25plusmetal-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.24-s25plusmetal-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30
