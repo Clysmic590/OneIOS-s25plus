@@ -1,0 +1,522 @@
+diff --git a/runtime/bridges/audio/aaudio_helper.c b/runtime/bridges/audio/aaudio_helper.c
+index 4dc2361..b7eef89 100644
+--- a/runtime/bridges/audio/aaudio_helper.c
++++ b/runtime/bridges/audio/aaudio_helper.c
+@@ -114,6 +114,7 @@ static int out_path;                             // the speaker stream's path
+ static bool continuous;                          // its reader (the DSP, AAudio's endpoint) takes frames all the time
+ static unsigned uclamp_min = 512;                // ONEIOS_AUDIO_UCLAMP (0..1024; 0: none)
+ static unsigned told_frames;                     // the output latency iOS was told (AU_TOLD; 0: not known)
++static unsigned speaker_gain = 100;              // physical volume keys, before PCM enters the ring
+ 
+ // ---- the speaker ring (guarded by ring_lock) ----------------------------------------------------
+ static int16_t ring[RING_FRAMES * 2];
+@@ -708,16 +709,19 @@ static void *writer(void *arg)
+     if (aim != fitted) { fitted = aim; buffer_fit(d, aim); }
+     if (play) {
+       resample(chunk, length, from, take);
++      double stall_since = now_s();
+       for (unsigned done = 0; done < length && atomic_load(&d->run);) {
+         aaudio_result_t n = AAudioStream_write(d->stream, chunk + 2 * done, (int32_t)(length - done), 200000000);   // 200 ms
+-        if (n < 0) {
+-          fprintf(stderr, "oneios-audio: speaker write: %s\n", AAudio_convertResultToText(n));
++        if (n < 0 || (n == 0 && now_s() - stall_since >= 1.0)) {
++          fprintf(stderr, "oneios-audio: speaker write: %s; reopen on the next playback data\n",
++                  n < 0 ? AAudio_convertResultToText(n) : "no frames accepted for one second");
+           report(true, EIO);
+-          struct timespec nap = { 0, 50000000 };
+-          nanosleep(&nap, NULL);
+-          break;
++          atomic_store(&d->run, false);
++          return NULL;
+         }
+-        done += (unsigned)n;                             // 0: the server took nothing for 200 ms (a stall): again
++        if (!n) { usleep(2000); continue; }
++        stall_since = now_s();
++        done += (unsigned)n;
+         d->frames += (uint64_t)n;
+       }
+     }
+@@ -791,7 +795,8 @@ static void pause_output(void)
+ static int start_dir(bool output, unsigned rate, unsigned channels)
+ {
+   dir_state *d = output ? &out_dir : &in_dir;
+-  if (output && d->stream && rate == (unsigned)AAudioStream_getSampleRate(d->stream) && channels == d->channels) {
++  if (output && d->stream && atomic_load(&d->run) &&
++      rate == (unsigned)AAudioStream_getSampleRate(d->stream) && channels == d->channels) {
+     pthread_mutex_lock(&ring_lock);                      // the lingering stream: on at once (a tail still in the ring plays first)
+     guest_on = true;
+     generation++;
+@@ -861,8 +866,8 @@ static void put_pcm(const int16_t *pcm, unsigned frames)
+   for (unsigned i = 0; i < frames; i++) {
+     unsigned at = (ring_head + ring_count + i) % RING_FRAMES;
+     int left = pcm[2 * i], right = pcm[2 * i + 1];
+-    ring[2 * at] = (int16_t)left;
+-    ring[2 * at + 1] = (int16_t)right;
++    ring[2 * at] = (int16_t)(speaker_gain == 100 ? left : left * (int)speaker_gain / 100);
++    ring[2 * at + 1] = (int16_t)(speaker_gain == 100 ? right : right * (int)speaker_gain / 100);
+     unsigned mag_left = (unsigned)abs(left), mag_right = (unsigned)abs(right);
+     if (mag_left > peak) peak = mag_left;
+     if (mag_right > peak) peak = mag_right;
+@@ -955,15 +960,15 @@ int main(int argc, char **argv)
+           mmap_want == MMAP_EXCLUSIVE ? "exclusive first (shared only with system_server)" : "shared (only with system_server)",
+           uclamp_min, buffer, FRAMES_MS(RING_FRAMES), target_text, target_decay_s, linger_s);
+   static struct { struct au_header header; int16_t pcm[AU_MAX_FRAMES * 2]; } packet;
++  unsigned speaker_rate = 0, speaker_channels = 0;
++  double retry_speaker_at = 0;
+   for (;;) {
+-    struct pollfd wait = { .fd = sock, .events = POLLIN };
+-    if (poll(&wait, 1, 1000) == 0) {                       // a quiet second: close a stream that lingered long enough
+-      if (out_dir.stream && !guest_on && since(&idle_since) >= linger_s) {
+-        stop_dir(true);
+-        fprintf(stderr, "oneios-audio: speaker closed after %u s of silence\n", linger_s);
+-      }
+-      continue;
++    if (out_dir.stream && !guest_on && since(&idle_since) >= linger_s) {
++      stop_dir(true);
++      fprintf(stderr, "oneios-audio: speaker closed after %u s of silence\n", linger_s);
+     }
++    struct pollfd wait = { .fd = sock, .events = POLLIN };
++    if (poll(&wait, 1, 1000) == 0) continue;
+     ssize_t got = recv(sock, &packet, sizeof packet, MSG_DONTWAIT);
+     if (got < 0 && errno == EAGAIN) continue;
+     if (got == 0) break;                                   // xnuhost closed its end (or exited)
+@@ -972,20 +977,41 @@ int main(int argc, char **argv)
+     bool output = packet.header.output;
+     switch (packet.header.kind) {
+     case AU_START: {
++      if (output) {
++        speaker_rate = packet.header.value;
++        speaker_channels = packet.header.channels;
++        retry_speaker_at = now_s() + 1.0;
++      }
+       int rc = start_dir(output, packet.header.value, packet.header.channels);
+       if (rc) report(output, rc);
+       break;
+     }
+     case AU_STOP:
++      if (output) speaker_rate = 0;
+       if (output && linger_s) pause_output();
+       else stop_dir(output);
+       break;
+     case AU_PCM: {
+       unsigned frames = (unsigned)(((size_t)got - sizeof packet.header) / 4);
+       if (frames > packet.header.value) frames = packet.header.value;
+-      if (output && out_dir.stream && frames) put_pcm(packet.pcm, frames);
++      if (output && frames && speaker_rate) {
++        if ((!out_dir.stream || !atomic_load(&out_dir.run)) && now_s() >= retry_speaker_at) {
++          retry_speaker_at = now_s() + 1.0;
++          int rc = start_dir(true, speaker_rate, speaker_channels);
++          if (rc) report(true, rc);
++          else fprintf(stderr, "oneios-audio: speaker stream reopened\n");
++        }
++        if (out_dir.stream && atomic_load(&out_dir.run)) put_pcm(packet.pcm, frames);
++      }
+       break;
+     }
++    case AU_GAIN_STEP:
++      if (output) {
++        if (packet.header.value && speaker_gain < 100) speaker_gain += 10;
++        else if (!packet.header.value && speaker_gain) speaker_gain -= 10;
++        fprintf(stderr, "oneios-audio: speaker gain %u%% (volume key)\n", speaker_gain);
++      }
++      break;
+     case AU_PROBE: {
+       unsigned frames = probe();
+       struct au_header reply = { .kind = AU_LATENCY, .output = 1, .value = frames };
+diff --git a/runtime/bridges/audio/audio_proto.h b/runtime/bridges/audio/audio_proto.h
+index ec6b24f..ced96d4 100644
+--- a/runtime/bridges/audio/audio_proto.h
++++ b/runtime/bridges/audio/audio_proto.h
+@@ -7,7 +7,7 @@
+ // AU_PROBE (xnuhost -> helper, before the guest boots): open the speaker in silence and measure its latency;
+ // AU_LATENCY (helper -> xnuhost): its answer, value = frames at 48 kHz (0: not measured); AU_TOLD (xnuhost ->
+ // helper): the output latency the guest publishes to iOS, value = frames (for the helper's end-to-end line).
+-enum { AU_START = 1, AU_STOP = 2, AU_PCM = 3, AU_STATE = 4, AU_PROBE = 5, AU_LATENCY = 6, AU_TOLD = 7 };
++enum { AU_START = 1, AU_STOP = 2, AU_PCM = 3, AU_STATE = 4, AU_PROBE = 5, AU_LATENCY = 6, AU_TOLD = 7, AU_GAIN_STEP = 8 };
+ struct au_header {
+   uint8_t  kind;          // AU_*
+   uint8_t  output;        // 1 = the speaker stream, 0 = the microphone stream
+diff --git a/runtime/bridges/audio/backend.c b/runtime/bridges/audio/backend.c
+index 9ddb495..a8c9e5d 100644
+--- a/runtime/bridges/audio/backend.c
++++ b/runtime/bridges/audio/backend.c
+@@ -132,6 +132,13 @@ void br_audio_told(const br_audio_backend *backend, void *ctx, unsigned frames)
+   (void)send_message(ctx, &told, NULL, 0);
+ }
+ 
++int br_audio_volume_key(const br_audio_backend *backend, void *ctx, bool up)
++{
++  if (backend != &helper_backend || !ctx) return -ENOTSUP;
++  struct au_header step = { .kind = AU_GAIN_STEP, .output = 1, .value = up };
++  return send_message(ctx, &step, NULL, 0);
++}
++
+ const br_audio_backend *br_audio_helper(const char *path, void **ctx)
+ {
+   int pair[2];
+diff --git a/runtime/bridges/include/bridges/bridges.h b/runtime/bridges/include/bridges/bridges.h
+index 47ebe40..76480ed 100644
+--- a/runtime/bridges/include/bridges/bridges.h
++++ b/runtime/bridges/include/bridges/bridges.h
+@@ -220,6 +220,8 @@ const br_audio_backend *br_audio_helper(const char *path, void **ctx);
+ int br_audio_probe_latency(const br_audio_backend *backend, void *ctx, unsigned timeout_ms);
+ // Tells the helper the output latency the guest publishes (frames), for its end-to-end line. No-op otherwise.
+ void br_audio_told(const br_audio_backend *backend, void *ctx, unsigned frames);
++// Adjust the helper's speaker gain by one volume-key step.
++int br_audio_volume_key(const br_audio_backend *backend, void *ctx, bool up);
+ // A back end that drops output and gives silence (no helper, tests).
+ const br_audio_backend *br_audio_null(void **ctx);
+ 
+diff --git a/runtime/bridges/tests/test_audio_helper.c b/runtime/bridges/tests/test_audio_helper.c
+index 34e0b0f..28e6171 100644
+--- a/runtime/bridges/tests/test_audio_helper.c
++++ b/runtime/bridges/tests/test_audio_helper.c
+@@ -135,6 +135,8 @@ void AAudioStreamBuilder_setInputPreset(AAudioStreamBuilder *b, aaudio_input_pre
+ aaudio_result_t AAudioStreamBuilder_delete(AAudioStreamBuilder *b) { free(b); return AAUDIO_OK; }
+ static AAudioStream *last_out, *last_in;
+ static int out_opens;
++static atomic_bool reject_write;
++static atomic_int playback_peak;
+ aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b, AAudioStream **out)
+ {
+   AAudioStream *s = calloc(1, sizeof *s);
+@@ -173,6 +175,7 @@ aaudio_result_t AAudioStream_close(AAudioStream *s)      // the stream is kept f
+ }
+ aaudio_result_t AAudioStream_write(AAudioStream *s, const void *buffer, int32_t frames, int64_t timeout_ns)
+ {
++  if (atomic_exchange(&reject_write, false)) return -899;
+   // As AudioTrack's blocking write: what fits goes at once, the rest as room comes, until the timeout.
+   struct timespec t0;
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+@@ -192,6 +195,8 @@ aaudio_result_t AAudioStream_write(AAudioStream *s, const void *buffer, int32_t
+     int32_t n = frames - done < room ? frames - done : (int32_t)room;
+     double now = now_s();
+     for (int i = done * s->channels; i < (done + n) * s->channels; i++) {
++      int magnitude = abs((int)pcm[i]);
++      if (magnitude > atomic_load(&playback_peak)) atomic_store(&playback_peak, magnitude);
+       if (pcm[i]) s->nonzero++;
+       if (s->channels == 2 && i % 2 == 0 && s->next_mark < MARKS && s->sent[s->next_mark] > 0 && pcm[i] == mark_value(s->next_mark)) {
+         s->wrote[s->next_mark] = now;
+@@ -743,6 +748,19 @@ int main(void)
+   unsetenv("ONEIOS_AUDIO_TARGET_DECAY_S");
+   fake_hal = HAL_NO_MMAP;
+ 
++  // A disconnected writer is reopened while PCM keeps coming; key gain applies to the recovered output.
++  fprintf(stderr, "-- speaker recovery and button gain\n");
++  helper_up("0");
++  opens = out_opens;
++  atomic_store(&playback_peak, 0);
++  atomic_store(&reject_write, true);
++  send_header(AU_GAIN_STEP, true, 0, 0);
++  send_header(AU_START, true, 2, 48000);
++  play(1.6, 0);
++  helper_down();
++  CHECK(out_opens == opens + 2);
++  CHECK(atomic_load(&playback_peak) >= 800 && atomic_load(&playback_peak) <= 900);
++
+   printf("test_audio_helper: %d checks, %d failed\n", checks, failures);
+   return failures != 0;
+ }
+diff --git a/runtime/bridges/thermal/test_thermal.c b/runtime/bridges/thermal/test_thermal.c
+index f1f0d25..42b9ae4 100644
+--- a/runtime/bridges/thermal/test_thermal.c
++++ b/runtime/bridges/thermal/test_thermal.c
+@@ -220,6 +220,8 @@ static void test_sysfs(void)
+   zone(5, "xo-therm", 33204);
+   zone(6, "epm0", -273000);
+   zone(7, "cpu-0-0-0", -273000);            // an off sensor is not the hottest
++  zone(8, "cpu-hw-trip-0", 105000);
++  zone(9, "cpu-hw-trip-1", 105000);
+   put("/sys/class/sec/sec-ap-thermistor/temperature", "362\n");
+   put("/sys/class/power_supply/battery/temp", "331\n");
+   br_thermal_sensors s;
+@@ -228,6 +230,11 @@ static void test_sysfs(void)
+   br_thermal_raw r;
+   br_thermal_read(&s, &r);
+   CHECK(r.cpu == 615 && r.gpu == 550 && r.ddr == 450 && r.xo == 332 && r.soc == 615 && !strcmp(r.soc_zone, "cpu-1-2-1"));
++  zone(1, "cpu-1-2-1", 105500);
++  br_thermal_read(&s, &r);
++  CHECK(r.cpu == 1055 && r.soc == 1055);
++  zone(1, "cpu-1-2-1", 61500);
++  br_thermal_read(&s, &r);
+   CHECK(r.ap == 362 && r.battery == 331 && r.lrp == BR_THERMAL_UNKNOWN && r.skin == 362);      // no lrp: the board thermistor
+   put("/sys/class/power_supply/battery/lrp", "401\n");
+   br_thermal_read(&s, &r);
+diff --git a/runtime/bridges/thermal/thermal.c b/runtime/bridges/thermal/thermal.c
+index d2ea8ba..6f6bc66 100644
+--- a/runtime/bridges/thermal/thermal.c
++++ b/runtime/bridges/thermal/thermal.c
+@@ -162,6 +162,8 @@ static int32_t read_deci(const char *root, const char *rel)
+ 
+ static int group_of(const char *type)
+ {
++  // SM8850 exports fixed hardware trip thresholds alongside the live readings.
++  if (!strncmp(type, "cpu-hw-trip-", sizeof("cpu-hw-trip-") - 1)) return -1;
+   if (!strncmp(type, "cpu-", 4) || !strncmp(type, "cpuss-", 6)) return 0;
+   if (!strncmp(type, "gpuss-", 6)) return 1;
+   if (!strcmp(type, "ddr")) return 2;
+diff --git a/runtime/display/src/jni.c b/runtime/display/src/jni.c
+index cb4b26e..3a4b478 100644
+--- a/runtime/display/src/jni.c
++++ b/runtime/display/src/jni.c
+@@ -177,8 +177,8 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+   unsigned long frames = 0, direct_frames = 0, refused = 0, held_flushes = 0;
+   bool announced = false, held = false;
+   struct timespec hold_start;
+-  struct { unsigned long posted, direct, unchanged; long long lock_us, copy_us, copy_max, hash_us, rows, since, cpu; } st =
+-    { 0, 0, 0, 0, 0, 0, 0, 0, now_us(), cpu_us() };
++  struct { unsigned long posted, direct, unchanged, hash_skips; long long lock_us, copy_us, copy_max, hash_us, rows, since, cpu; } st =
++    { .since = now_us(), .cpu = cpu_us() };
+   int result;
+   for (;;) {
+     // Held: the guest's frame is not shown yet, the damage adds up, and `ready` is looked for at every flush and
+@@ -201,7 +201,10 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+     int hashed = -1;
+     long long th = now_us();
+     if (direct->pending) {
+-      hashed = hashing ? xhd_direct_damage(direct, &damage, &changed) : -ENOMEM;
++      if (hashing && xhd_damage_should_hash(&damage)) {
++        hashed = xhd_direct_damage(direct, &damage, &changed);
++        xhd_damage_observe(&damage, hashed ? NULL : &changed);
++      } else if (hashing) st.hash_skips++;
+       if (hashed) changed = (struct xhd_rect){ 0, 0, f->width, f->height };        // copied whole (or refused below)
+       st.hash_us += now_us() - th;
+       if (!hashed && !changed.w && !pending.w && frames >= 4) {
+@@ -298,12 +301,12 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
+       long long cpu = cpu_us();
+       unsigned long seen = st.posted + st.unchanged;
+       fprintf(stderr, "oneios-display: %.0f s: %lu frames from xnuhost, %lu unchanged (nothing posted), %lu posted (%lu from guest RAM, "
+-              "%.0f%% of the rows copied); hash mean %.1f ms; buffer wait mean %.1f ms; copy mean %.1f ms, max %.1f ms; this process %.0f%% of a core\n",
++              "%.0f%% of the rows copied); hash mean %.1f ms (%lu skipped); buffer wait mean %.1f ms; copy mean %.1f ms, max %.1f ms; this process %.0f%% of a core\n",
+               (now - st.since) / 1e6, seen, st.unchanged, st.posted, st.direct,
+-              st.direct ? st.rows * 100.0 / ((double)st.direct * f->height) : 0.0, seen ? st.hash_us / 1000.0 / seen : 0.0,
++              st.direct ? st.rows * 100.0 / ((double)st.direct * f->height) : 0.0, seen ? st.hash_us / 1000.0 / seen : 0.0, st.hash_skips,
+               st.posted ? st.lock_us / 1000.0 / st.posted : 0.0, st.posted ? st.copy_us / 1000.0 / st.posted : 0.0, st.copy_max / 1000.0,
+               (cpu - st.cpu) * 100.0 / (double)(now - st.since));
+-      st = (__typeof__(st)){ 0, 0, 0, 0, 0, 0, 0, 0, now, cpu };
++      st = (__typeof__(st)){ .since = now, .cpu = cpu };
+     }
+   }
+   xhd_damage_free(&damage);
+diff --git a/runtime/display/src/xhd.c b/runtime/display/src/xhd.c
+index 1bf3f59..46dc364 100644
+--- a/runtime/display/src/xhd.c
++++ b/runtime/display/src/xhd.c
+@@ -343,6 +343,25 @@ void xhd_damage_commit(struct xhd_damage *d)
+   d->valid = 1;
+ }
+ 
++int xhd_damage_should_hash(struct xhd_damage *d)
++{
++  if (!d->skip_frames) return 1;
++  d->skip_frames--;
++  d->valid = 0;
++  return 0;
++}
++
++void xhd_damage_observe(struct xhd_damage *d, const struct xhd_rect *changed)
++{
++  uint64_t full = (uint64_t)d->width * d->height;
++  if (!d->valid || !changed || (uint64_t)changed->w * changed->h * 4 < full * 3) {
++    d->wide_frames = 0;
++  } else if (++d->wide_frames == 3) {
++    d->wide_frames = 0;
++    d->skip_frames = 8;
++  }
++}
++
+ int xhd_send_done(int fd, uint64_t seq, uint32_t flags)
+ {
+   struct xhd_message m = { { 'X', 'H', 'D', 'A' }, (uint32_t)seq, (uint32_t)(seq >> 32), flags, 0 };
+diff --git a/runtime/display/src/xhd.h b/runtime/display/src/xhd.h
+index 7ebaa71..8deef0c 100644
+--- a/runtime/display/src/xhd.h
++++ b/runtime/display/src/xhd.h
+@@ -91,7 +91,7 @@ int xhd_copy_direct(const struct xhd_direct *d, uint8_t *dst, size_t dst_stride,
+ // stream, so the same picture in another surface (the compositor rotates three, scattered differently over RAM) hashes
+ // the same. `shown` holds the hashes of what the layer shows, valid once a whole frame was posted.
+ #define XHD_TILES 4
+-struct xhd_damage { uint32_t width, height, tile; uint64_t *shown, *next; int valid; };
++struct xhd_damage { uint32_t width, height, tile; uint64_t *shown, *next; int valid; unsigned wide_frames, skip_frames; };
+ int  xhd_damage_init(struct xhd_damage *d, uint32_t width, uint32_t height);   // 0 or -ENOMEM
+ void xhd_damage_free(struct xhd_damage *d);
+ // Hashes the pending frame (all of it) and compares: 0 with *dirty the bounding rectangle of the tiles that differ from
+@@ -99,6 +99,9 @@ void xhd_damage_free(struct xhd_damage *d);
+ int  xhd_direct_damage(const struct xhd_direct *dir, struct xhd_damage *d, struct xhd_rect *dirty);
+ // The frame just hashed is in the layer now (posted whole or its damage over the rest).
+ void xhd_damage_commit(struct xhd_damage *d);
++// Pause whole-frame hashing during sustained full-screen changes. Skips invalidate the baseline.
++int xhd_damage_should_hash(struct xhd_damage *d);
++void xhd_damage_observe(struct xhd_damage *d, const struct xhd_rect *changed);
+ uint64_t xhd_hash_pixels(uint64_t state[4], const uint8_t *p, size_t bytes, size_t at);   // (for the tests)
+ #define XHD_DONE_FAILED 1u
+ #define XHD_DONE_UNCHANGED 2u                         // the frame was what the layer showed: nothing was posted
+diff --git a/runtime/display/tests/test_display.c b/runtime/display/tests/test_display.c
+index 28bb3cb..9be1091 100644
+--- a/runtime/display/tests/test_display.c
++++ b/runtime/display/tests/test_display.c
+@@ -491,6 +491,16 @@ int main(int argc, char **argv)
+   test_copy_formats();
+   test_panel_report();
+   test_direct();
++  struct xhd_damage adaptive = { .width = 100, .height = 100, .valid = 1 };
++  const struct xhd_rect broad = { 0, 0, 100, 80 }, narrow = { 0, 0, 20, 20 };
++  xhd_damage_observe(&adaptive, &broad);
++  xhd_damage_observe(&adaptive, &narrow);
++  for (unsigned i = 0; i < 3; i++) {
++    CHECK(xhd_damage_should_hash(&adaptive));
++    xhd_damage_observe(&adaptive, &broad);
++  }
++  for (unsigned i = 0; i < 8; i++) CHECK(!xhd_damage_should_hash(&adaptive) && !adaptive.valid);
++  CHECK(xhd_damage_should_hash(&adaptive) && !adaptive.valid);
+   test_hold_first(dir);
+   test_protocol(dir);
+   if (argc > 1) test_displayctl(argv[1], dir);
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 9bf0854..be0c74c 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -338,6 +338,8 @@ int xh_config_finish(xh_config *c)
+       fprintf(stderr, "xnuhost: Galaxy S25 built-in HID button routing enabled (%s)\n", model);
+     }
+     if (plus) {
++      c->audio_volume_keys = true;
++      if (!getenv("ONEIOS_AUDIO_LINGER_S")) setenv("ONEIOS_AUDIO_LINGER_S", "15", 0);
+       // Raise the OneOS automatic S25+ cap by one 256 MiB step on a 12 GB phone.
+       // The fit and host-floor limits still apply below.
+       if (c->ram_bytes == 0 && c->ram_percent == 45)
+diff --git a/runtime/xnuhost/src/input.c b/runtime/xnuhost/src/input.c
+index 12755a9..d35dd35 100644
+--- a/runtime/xnuhost/src/input.c
++++ b/runtime/xnuhost/src/input.c
+@@ -55,6 +55,22 @@ void xh_input_frame_shown(void)
+ }
+ 
+ void (*xh_input_power_key)(void);
++void (*xh_input_volume_key)(bool up);
++static unsigned volume_held, volume_chord;  // the keys can arrive from different evdev devices
++
++static void volume_event(uint16_t code, int32_t value)
++{
++  unsigned key = 1u << (code - KEY_VOLUMEDOWN_);
++  if (value == 1) {
++    volume_held |= key;
++    if (volume_held == 3) volume_chord = 3;
++  } else if (value == 0 && (volume_held & key)) {
++    void (*adjust)(bool) = __atomic_load_n(&xh_input_volume_key, __ATOMIC_ACQUIRE);
++    if (!(volume_chord & key) && adjust) adjust(code == KEY_VOLUMEUP_);
++    volume_held &= ~key;
++    volume_chord &= ~key;
++  }
++}
+ 
+ static void send_event(xh_input_source *s, uint16_t type, uint16_t code, int32_t value)
+ {
+@@ -185,7 +201,11 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+       continue;
+     }
+     if (v->type == EV_SYN_) {
+-      if (v->code == SYN_DROPPED_) { s->dropping = true; continue; }
++      if (v->code == SYN_DROPPED_) {
++        if (s->sent_keys & 3) volume_held = volume_chord = 0;
++        s->dropping = true;
++        continue;
++      }
+       if (v->code != SYN_REPORT_) continue;
+       if (s->touch) send_event(s, EV_MSC_, MSC_TIMESTAMP_, (int32_t)scan_ticks(v->time_ns, now_ns, now_counter, hz));
+       send_event(s, EV_SYN_, SYN_REPORT_, 0);
+@@ -201,6 +221,7 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+         }
+       }
+       if (side || (s->touch && v->code == BTN_TOUCH_)) send_event(s, EV_KEY_, v->code, v->value);
++      if (v->code == KEY_VOLUMEDOWN_ || v->code == KEY_VOLUMEUP_) volume_event(v->code, v->value);
+       if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
+     } else if (v->type == EV_ABS_ && s->touch) {
+       if (v->code == ABS_MT_SLOT_ || v->code == ABS_MT_TRACKING_ID_ || v->code == ABS_MT_POSITION_X_ || v->code == ABS_MT_POSITION_Y_ ||
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 78af75b..8faeb64 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -309,6 +309,13 @@ static br_camera *camera;          // the camera helper process (runtime/bridges
+ static br_bright *brightness;     // the panel's backlight and the light sensor (runtime/bridges/brightness)
+ // A power-key press from the evdev reader: the touch IC woken (iOS turns its display on or off next).
+ static void power_key_pressed(void) { br_bright_key(brightness); }
++static const br_audio_backend *session_audio;
++static void *session_audio_ctx;
++static void volume_key_released(bool up)
++{
++  int error = br_audio_volume_key(session_audio, session_audio_ctx, up);
++  if (error) LOGE("audio: volume key: %s", strerror(-error));
++}
+ static br_battery *battery;       // the phone's battery for iOS (runtime/bridges/battery)
+ static br_thermal *thermal;       // the phone's temperatures: iOS's pressure level and xnuhost's CPU step (runtime/bridges/thermal)
+ static br_cpu_topology cpu_host;  // the host's CPUs, and the plan as made: the thermal steps narrow it
+@@ -789,6 +796,12 @@ static int boot(void)
+     if (audio && br_virtio_snd_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, audio, audio_ctx)) {
+       kinds[ndev++] = XL_DEV_SND;
+       audio_latency_arg(audio, audio_ctx);
++      if (config.audio_volume_keys && audio_ctx) {
++        session_audio = audio;
++        session_audio_ctx = audio_ctx;
++        __atomic_store_n(&xh_input_volume_key, volume_key_released, __ATOMIC_RELEASE);
++        LOGI("audio: S25+ volume buttons also control the speaker's output gain (return chord excluded)");
++      }
+     }
+ 
+     // The camera: a helper process (Android's camera libraries are shared libraries) that opens a camera only
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index dc7eb97..a5ac873 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -100,6 +100,7 @@ typedef struct {
+   unsigned text_fixups_length;
+   bool  input;              // read /dev/input
+   bool  touch_sleep;        // touch-sleep=0: the brightness bridge never puts the touch IC to sleep (ONEIOS_TSP_OFF=0)
++  bool  audio_volume_keys;
+   char  input_script[512];  // a file of scripted touches and keys (input_script.c), "" = none
+   char  pen[8];             // pen=off (the default until a phone session proves it) | auto: the host's pen digitizer (pen.c,
+                             // xh_pen_lookup) or the script's pen as the guest's pen device /arm-io/input-1, and oneios-pen=1
+@@ -655,6 +656,7 @@ void  xh_input_frame_shown(void);
+ // Called on the input thread at each press of the power key (KEY_POWER down) that is passed to the guest: the brightness
+ // bridge wakes the touch IC (br_bright_key). NULL: nothing.
+ extern void (*xh_input_power_key)(void);
++extern void (*xh_input_volume_key)(bool up);
+ // One reader's filter, the part of input.c the host tests run. An event as read, its time on CLOCK_MONOTONIC.
+ #define XH_INPUT_SLOTS 16
+ typedef struct { int64_t time_ns; uint16_t type, code; int32_t value; } xh_input_ev;
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 9f75748..0adbedf 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1194,6 +1194,8 @@ static int fake_read_state(xh_input_source *s, xh_input_state *state) { (void)s;
+ 
+ static unsigned power_presses;
+ static void count_power_press(void) { power_presses++; }
++static int volume_steps;
++static void count_volume_release(bool up) { volume_steps += up ? 1 : -1; }
+ 
+ static void test_input_filter(void)
+ {
+@@ -1272,6 +1274,22 @@ static void test_input_filter(void)
+   CHECK(n == 3 && got[0].code == 115 && got[0].value == 1 && got[1].code == 116 && got[1].value == 0 && got[2].type == 0 && k.sent_keys == 2);
+   CHECK(power_presses == 1);                                                    // a release (and a resync) is no press
+   xh_input_power_key = NULL;
++
++  xh_input_source other;
++  xh_input_source_init(&other, d.dev, "other keys", false);
++  xh_input_volume_key = count_volume_release;
++  const xh_input_ev volume_up[] = { { now, 1, 115, 1 }, { now, 1, 115, 2 }, { now, 1, 115, 0 } };
++  const xh_input_ev volume_down[] = { { now, 1, 114, 1 }, { now, 1, 114, 0 } };
++  xh_input_feed(&k, volume_up, 3, now, counter, hz);
++  CHECK(volume_steps == 1);
++  xh_input_feed(&k, volume_up, 1, now, counter, hz);
++  xh_input_feed(&other, volume_down, 1, now, counter, hz);
++  xh_input_feed(&k, volume_up + 2, 1, now, counter, hz);
++  xh_input_feed(&other, volume_down + 1, 1, now, counter, hz);
++  CHECK(volume_steps == 1);
++  xh_input_feed(&other, volume_down, 2, now, counter, hz);
++  CHECK(volume_steps == 0);
++  xh_input_volume_key = NULL;
+ }
+ 
+ // The pen (pen.c): which devices are taken, the evdev state as the guest's sample, the frames the guest's device gets.
