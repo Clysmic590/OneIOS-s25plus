@@ -1,4 +1,4 @@
-name: Build OneiOS S25+ APK
+name: Build OneiOS Galaxy S25 series APK
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
           ref: bdf3db05e0aaacf996d1ec2a1bd3f0019b0a7f82
           path: source
 
-      - name: Apply S25+ app patch
+      - name: Apply Galaxy S25 app patch
         working-directory: source
         run: |
           git apply --check ../patch/patches/s25-plus-app.patch
@@ -78,9 +78,11 @@ jobs:
         working-directory: source
         run: scripts/build-guest-manager.sh --debug
 
-      - name: Verify S25+ profile and gate
+      - name: Verify Galaxy S25 profiles and switch checks
         working-directory: source/app-android
-        run: ./gradlew --no-daemon :core:model:test --tests com.fahadali.oneos.core.model.OneiosTest
+        run: |
+          ./gradlew --no-daemon :core:model:test --tests com.fahadali.oneos.core.model.OneiosTest \
+            :core:root:testDebugUnitTest --tests 'com.fahadali.oneos.core.root.OneiosScriptTest.theSwitchRefusesOtherPhones'
 
       - name: Build debug APK
         working-directory: source/app-android
@@ -91,15 +93,15 @@ jobs:
         run: |
           apk=app-android/app/build/outputs/apk/full/debug/app-full-debug.apk
           test -s "$apk"
-          cp "$apk" OneiOS-S25Plus-Diagnostics.apk
-          sha256sum OneiOS-S25Plus-Diagnostics.apk > OneiOS-S25Plus-Diagnostics.apk.sha256
+          cp "$apk" OneiOS-S25-Series-0.5.16.apk
+          sha256sum OneiOS-S25-Series-0.5.16.apk > OneiOS-S25-Series-0.5.16.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Diagnostics
+          name: OneiOS-S25-Series-0.5.16
           path: |
-            source/OneiOS-S25Plus-Diagnostics.apk
-            source/OneiOS-S25Plus-Diagnostics.apk.sha256
+            source/OneiOS-S25-Series-0.5.16.apk
+            source/OneiOS-S25-Series-0.5.16.apk.sha256
           if-no-files-found: error
           retention-days: 30

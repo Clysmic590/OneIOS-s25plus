@@ -1,5 +1,5 @@
 diff --git a/app-android/app/build.gradle.kts b/app-android/app/build.gradle.kts
-index 8ec73ed..6370312 100644
+index 8ec73ed..7273b6f 100644
 --- a/app-android/app/build.gradle.kts
 +++ b/app-android/app/build.gradle.kts
 @@ -410,6 +410,7 @@ val releaseKeys: Properties? =
@@ -16,8 +16,8 @@ index 8ec73ed..6370312 100644
          }
 -        versionCode = 143 + commitsSinceBase
 -        versionName = "0.5." + (14 + commitsSinceBase)
-+        versionCode = 144 + commitsSinceBase
-+        versionName = "0.5." + (15 + commitsSinceBase)
++        versionCode = 145 + commitsSinceBase
++        versionName = "0.5." + (16 + commitsSinceBase)
          // 0.4.56 (73), TEST CHANNEL ONLY: the Find N6 set's Theme Store logs every OkHttp request and reply (n6g_r7,
          // patches/theme_store_netlog.py) for the owner's "No Data" log; the next public build goes back to n6g_r6.
          // Send to the OneOS team (0.4.29, both editions): the report service's
@@ -33,7 +33,6 @@ index 8ec73ed..6370312 100644
              // Pins for the root path: the launcher runs $STAGE/bin/oneos_root.sh only
              // with this SHA-256, and the app checks every list it ships against these.
              val rootBytes = rootScript.readBytes()
-
 diff --git a/app-android/app/src/full/assets/root/oneios_root.sh b/app-android/app/src/full/assets/root/oneios_root.sh
 index 9d341db..28929ff 100644
 --- a/app-android/app/src/full/assets/root/oneios_root.sh
@@ -208,7 +207,7 @@ index 5612d2b..3f7617a 100644
              // Pause and Resume when this tool takes them (its hello); the tool holds the request and keeps its parts.
 
 diff --git a/app-android/app/src/full/res/values/strings_oneios.xml b/app-android/app/src/full/res/values/strings_oneios.xml
-index e46482a..072d2f2 100644
+index e46482a..161c5c3 100644
 --- a/app-android/app/src/full/res/values/strings_oneios.xml
 +++ b/app-android/app/src/full/res/values/strings_oneios.xml
 @@ -10,10 +10,9 @@
@@ -220,7 +219,7 @@ index e46482a..072d2f2 100644
 -    <string name="oneios_not_this_phone_ack">I understand that iOS 27 (OneiOS) is mainly tested and working on the Galaxy S24 Ultra 5G (SM-S928B); on this phone it may be unstable, miss pieces, or not come back to One UI, and that One UI stops while it runs.</string>
 -    <string name="oneios_ack">I understand that iOS 27 (OneiOS) is experimental, has never been tested on a phone like this one, and that One UI stops while it runs.</string>
 +    <string name="oneios_not_this_phone_title">iOS 27 is unavailable on this phone</string>
-+    <string name="oneios_not_this_phone">This build supports the Galaxy S25 (SM-S931) and Galaxy S25+ (SM-S936).</string>
++    <string name="oneios_not_this_phone">This build supports the Galaxy S25 (SM-S931), S25+ (SM-S936), and S25 Ultra (SM-S938).</string>
 +    <string name="oneios_ack">I understand that iOS 27 (OneiOS) is experimental and may be unstable. One UI stops while it runs.</string>
      <string name="oneios_ack_read">I have read how to get back to One UI: Volume Up + Volume Down, both for 3 seconds.</string>
  
@@ -235,9 +234,8 @@ index e46482a..072d2f2 100644
      <string name="oneios_make_image_line">On this phone, from Apple\'s server: only the parts of the IPSW it needs</string>
      <string name="oneios_image_choose">I have the file</string>
      <string name="oneios_tool_sums">Check every file</string>
-
 diff --git a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
-index e6c7e06..ba2c09b 100644
+index e6c7e06..cf07b02 100644
 --- a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
 +++ b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
 @@ -35,19 +35,14 @@ object OneiosSystem {
@@ -246,7 +244,7 @@ index e6c7e06..ba2c09b 100644
  
 -    /** The phone it is mainly tested and working on: the Galaxy S24 Ultra (SM-S928, e3q, SM8650); other phones are warned, not refused (the owner, 2026-11-16). */
 -    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_ULTRA_8650)
-+    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_8750, Profiles.ID_S_PLUS_8750)
++    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_8750, Profiles.ID_S_PLUS_8750, Profiles.ID_S_ULTRA_8750)
  
      const val R_NOT_THIS_PHONE = "oneios-not-this-phone"
      const val R_EXPERIMENTAL = "oneios-experimental"
@@ -282,27 +280,26 @@ index e6c7e06..ba2c09b 100644
 +    fun gate(profile: PhoneProfile?, ticked: Boolean): Finding = when {
 +        !offeredOn(profile) -> Finding(
 +            GATE_ID, Level.BLOCK, "$NAME is unavailable on this phone",
-+            "This build supports the Galaxy S25 (SM-S931) and Galaxy S25+ (SM-S936).",
++            "This build supports the Galaxy S25 (SM-S931), S25+ (SM-S936), and S25 Ultra (SM-S938).",
              R_NOT_THIS_PHONE,
          )
 -        !offeredOn(profile) -> Finding(GATE_ID, Level.OK, "$NAME: not the phone it is mainly tested on, acknowledged")
          !ticked -> Finding(GATE_ID, Level.WARN, "$NAME is experimental", ACK, R_EXPERIMENTAL)
          else -> Finding(GATE_ID, Level.OK, "$NAME: experimental, acknowledged")
      }
-
 diff --git a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
-index fae14d7..05e3e34 100644
+index fae14d7..c317db6 100644
 --- a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
 +++ b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
-@@ -49,39 +49,50 @@ class OneiosTest {
+@@ -49,39 +49,53 @@ class OneiosTest {
      // --- Where it is offered ---------------------------------------------------
  
      @Test
 -    fun onlyTheGalaxyS24UltraIsOffered() {
-+    fun onlyTheS25AndS25PlusAreOffered() {
++    fun onlyTheSupportedGalaxyS25ProfilesAreOffered() {
          for (p in Profiles.BUILT_IN) {
 -            assertEquals(p.id, p.id == Profiles.ID_S_ULTRA_8650, OneiosSystem.offeredOn(p))
-+            assertEquals(p.id, p.id in setOf(Profiles.ID_S_8750, Profiles.ID_S_PLUS_8750), OneiosSystem.offeredOn(p))
++            assertEquals(p.id, p.id in setOf(Profiles.ID_S_8750, Profiles.ID_S_PLUS_8750, Profiles.ID_S_ULTRA_8750), OneiosSystem.offeredOn(p))
          }
          assertFalse(OneiosSystem.offeredOn(null))
 -        assertEquals("SM-S928", Profiles.S_ULTRA_8650.modelPrefix)
@@ -314,11 +311,15 @@ index fae14d7..05e3e34 100644
 +        assertTrue(OneiosSystem.offeredOn("SM-S931U1", "pa1q", "SM8750"))
 +        assertTrue(OneiosSystem.offeredOn("SM-S936B", "pa2q", "SM8750"))
 +        assertTrue(OneiosSystem.offeredOn("SM-S936U1", "pa2q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S938U1", "pa3q", "SM8750"))
          // The same model number on another chip or codename is not that phone.
 -        assertFalse(OneiosSystem.offeredOn("SM-S928B", "e3s", "s5e9945"))
+-        assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
 +        assertFalse(OneiosSystem.offeredOn("SM-S928B", "e3q", "SM8650"))
 +        assertFalse(OneiosSystem.offeredOn("SM-S931B", "pa2q", "SM8750"))
-         assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
++        assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa2q", "SM8750"))
++        assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8850"))
 +        assertFalse(OneiosSystem.offeredOn("SM-S936B", "pa2q", "s5e9945"))
 +        assertFalse(OneiosSystem.offeredOn("SM-S936B", "wrong-device", "SM8750"))
          assertFalse(OneiosSystem.offeredOn("SM-S921B", "e1q", "SM8650"))
@@ -359,7 +360,6 @@ index fae14d7..05e3e34 100644
      }
  
      /** It is its own kind of system: no Android image or file set stands for it. */
-
 diff --git a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosFailureReport.kt b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosFailureReport.kt
 new file mode 100644
 --- /dev/null
@@ -442,7 +442,7 @@ new file mode 100644
 +}
 
 diff --git a/switcher/assets/oneios_switch.sh b/switcher/assets/oneios_switch.sh
-index 272de3e..dac8401 100644
+index 272de3e..59f6466 100644
 --- a/switcher/assets/oneios_switch.sh
 +++ b/switcher/assets/oneios_switch.sh
 @@ -653,7 +653,9 @@ case "$MODE" in
@@ -463,7 +463,7 @@ index 272de3e..dac8401 100644
 +        gpu_mode=auto
 +        set --
 +        case "$(getprop ro.product.device):$(getprop ro.product.model)" in
-+            pa1q:SM-S931*|pa2q:SM-S936*)
++            pa1q:SM-S931*|pa2q:SM-S936*|pa3q:SM-S938*)
 +                gpu_mode=2d
 +                # Leave room on the host for allocations that grow after first boot.
 +                set -- --ram auto --set ram-percent=45 --set host-mem-log=5
@@ -505,7 +505,7 @@ index 272de3e..dac8401 100644
 -# Mainly tested on: the Galaxy S24 Ultra (docs/oneios.md, "Scope"): e3q on an
 -# SM8650, the SM-S928 models. The owner (2026-11-16): another phone may try it,
 -# told what to expect; nothing here refuses one any more.
-+# Match the app's S25 and S25+ profiles before changing the host.
++# Match the app's Galaxy S25 profiles before changing the host.
  P_MODEL=$(getprop ro.product.model)
  P_DEVICE=$(getprop ro.product.device)
  P_SOC=$(getprop ro.soc.model)
@@ -519,13 +519,12 @@ index 272de3e..dac8401 100644
 -    echo "WARNING: ones it is written for. Going on because you asked it to."
 -fi
 +case "$P_SOC:$P_DEVICE:$P_MODEL" in
-+    SM8750:pa1q:SM-S931*|SM8750:pa2q:SM-S936*) ;;
-+    *) refuse "this OneiOS build supports only the Galaxy S25 and S25+; this phone is ${P_MODEL:-unknown} (${P_DEVICE:-?}, ${P_SOC:-?})" ;;
++    SM8750:pa1q:SM-S931*|SM8750:pa2q:SM-S936*|SM8750:pa3q:SM-S938*) ;;
++    *) refuse "this OneiOS build supports only the Galaxy S25, S25+, and S25 Ultra; this phone is ${P_MODEL:-unknown} (${P_DEVICE:-?}, ${P_SOC:-?})" ;;
 +esac
  
  # The stage first: without a runtime that has xnuhost, that one line is the answer.
  stage_checks
-
 diff --git a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosJob.kt b/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosJob.kt
 index 12cbe1b..3ca00b5 100644
 --- a/app-android/app/src/full/kotlin/com/fahadali/oneos/session/OneiosJob.kt
@@ -589,7 +588,7 @@ index b68bb73..cb14978 100644
          dialog.show()
 
 diff --git a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/OneiosPlain.kt b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/OneiosPlain.kt
-index ba25914..43f6131 100644
+index ba25914..ff94b99 100644
 --- a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/OneiosPlain.kt
 +++ b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/OneiosPlain.kt
 @@ -138,8 +138,8 @@ object OneiosPlain {
@@ -599,13 +598,12 @@ index ba25914..43f6131 100644
 -            "galaxy s24 ultra" in p -> m(
 -                "iOS 27 isn't for this phone", "It runs on the Galaxy S24 Ultra (SM-S928) only.", OneiosFix.NONE, OneiosPart.PHONE,
 +            "this oneios build supports only" in p || "galaxy s24 ultra" in p -> m(
-+                "iOS 27 isn't for this phone", "This build supports the Galaxy S25 (SM-S931) and Galaxy S25+ (SM-S936).", OneiosFix.NONE, OneiosPart.PHONE,
++                "iOS 27 isn't for this phone", "This build supports the Galaxy S25 (SM-S931), S25+ (SM-S936), and S25 Ultra (SM-S938).", OneiosFix.NONE, OneiosPart.PHONE,
              )
              "not running as root" in p || "su could not be started" in p || p == "root did not answer in time" || p == "no answer from root" ||
                  p == "stopped before it finished" || p.startsWith("exit ") -> m(
-
 diff --git a/app-android/core/root/src/test/kotlin/com/fahadali/oneos/core/root/OneiosScriptTest.kt b/app-android/core/root/src/test/kotlin/com/fahadali/oneos/core/root/OneiosScriptTest.kt
-index 6eab994..4f68349 100644
+index 6eab994..43ec733 100644
 --- a/app-android/core/root/src/test/kotlin/com/fahadali/oneos/core/root/OneiosScriptTest.kt
 +++ b/app-android/core/root/src/test/kotlin/com/fahadali/oneos/core/root/OneiosScriptTest.kt
 @@ -605,16 +605,13 @@ class OneiosScriptTest {
@@ -614,7 +612,7 @@ index 6eab994..4f68349 100644
          assertFalse(OneiosRoot.STAGE == RootScript.STAGE)
 -        // The S24 Ultra only, checked by the script itself.
 -        assertTrue(sw.contains("SM-S928*") && sw.contains("e3q") && sw.contains("SM8650"))
-+        assertTrue(sw.contains("SM8750:pa1q:SM-S931*|SM8750:pa2q:SM-S936*"))
++        assertTrue(sw.contains("SM8750:pa1q:SM-S931*|SM8750:pa2q:SM-S936*|SM8750:pa3q:SM-S938*"))
      }
  
 -    /** The owner (2026-11-16): another phone may try it, told what to expect — a warning, not a refusal. */
@@ -624,7 +622,7 @@ index 6eab994..4f68349 100644
          val sw = code(switchScript).joinToString("\n")
 -        assertTrue(sw.contains("WARNING: OneiOS is mainly tested and working on the Galaxy S24 Ultra 5G"))
 -        assertFalse(sw.contains("refuse \"iOS runs on the Galaxy S24 Ultra"))
-+        assertTrue(sw.contains("refuse \"this OneiOS build supports only the Galaxy S25 and S25+"))
++        assertTrue(sw.contains("refuse \"this OneiOS build supports only the Galaxy S25, S25+, and S25 Ultra"))
      }
  
      /** Every refusal of the switch comes before its first change: nothing above "THE SESSION" stops or starts anything. */
