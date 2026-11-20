@@ -1095,7 +1095,7 @@ index 866eda4..95abc8f 100644
    ok = scenario("queue priorities by the owner's class (patch 0008)", classes) && ok;
 
 diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
-index 8bfdb93..41c42a0 100644
+index 8bfdb93..b02a688 100644
 --- a/runtime/xnuhost/src/config.c
 +++ b/runtime/xnuhost/src/config.c
 @@ -8,6 +8,11 @@
@@ -1119,7 +1119,7 @@ index 8bfdb93..41c42a0 100644
    if (c->gpu_priority < 0) c->gpu_priority = from_image.gpu_priority < 0 ? 1 : from_image.gpu_priority;
    if (c->spin_task < 0) c->spin_task = from_image.spin_task;
    if (c->map_defer < 0) c->map_defer = from_image.map_defer;
-@@ -315,6 +320,30 @@ int xh_config_finish(xh_config *c)
+@@ -315,6 +320,34 @@ int xh_config_finish(xh_config *c)
      strcpy(c->boot_args, "debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 "
             "sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 "
             "sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=1 droidvm-gpu-metal=1");
@@ -1127,30 +1127,34 @@ index 8bfdb93..41c42a0 100644
 +  char device[PROP_VALUE_MAX], model[PROP_VALUE_MAX];
 +  static const char buttons[] = " oneios-hid-buttons-builtin=1";
 +  static const char compressor[] = " vm_compressor=4";
-+  if (!strcmp(c->mode, "takeover") &&
-+      __system_property_get("ro.product.device", device) > 0 && !strcmp(device, "pa2q") &&
-+      __system_property_get("ro.product.model", model) > 0 && !strncmp(model, "SM-S936", 7)) {
-+    // The S25+ exclusive stream stopped accepting frames while iOS was still producing them.
-+    if (!getenv("ONEIOS_AUDIO_MMAP") && !setenv("ONEIOS_AUDIO_MMAP", "off", 0))
-+      fprintf(stderr, "xnuhost: S25+ speaker uses the Android mixer by default\n");
++  if (!strcmp(c->mode, "takeover") && __system_property_get("ro.product.device", device) > 0 &&
++      __system_property_get("ro.product.model", model) > 0) {
++    bool plus = !strcmp(device, "pa2q") && !strncmp(model, "SM-S936", 7);
++    bool s25 = plus || (!strcmp(device, "pa1q") && !strncmp(model, "SM-S931", 7)) ||
++                       (!strcmp(device, "pa3q") && !strncmp(model, "SM-S938", 7));
 +    size_t used = strlen(c->boot_args);
-+    if (!has_switch(c->boot_args, "oneios-hid-buttons-builtin") && sizeof buttons <= sizeof c->boot_args - used) {
++    if (s25 && !has_switch(c->boot_args, "oneios-hid-buttons-builtin") && sizeof buttons <= sizeof c->boot_args - used) {
 +      memcpy(c->boot_args + used, buttons, sizeof buttons);
-+      fprintf(stderr, "xnuhost: S25+ built-in HID button routing enabled\n");
++      fprintf(stderr, "xnuhost: Galaxy S25 built-in HID button routing enabled (%s)\n", model);
 +    }
-+    // The iOS default only swaps frozen applications. Let the general compressor
-+    // spill to the writable Data volume before jetsam reaches backboardd.
-+    used = strlen(c->boot_args);
-+    if (!has_switch(c->boot_args, "vm_compressor") && sizeof compressor <= sizeof c->boot_args - used) {
-+      memcpy(c->boot_args + used, compressor, sizeof compressor);
-+      fprintf(stderr, "xnuhost: S25+ general compressor swap enabled\n");
++    if (plus) {
++      // The S25+ exclusive stream stopped accepting frames while iOS was still producing them.
++      if (!getenv("ONEIOS_AUDIO_MMAP") && !setenv("ONEIOS_AUDIO_MMAP", "off", 0))
++        fprintf(stderr, "xnuhost: S25+ speaker uses the Android mixer by default\n");
++      // The iOS default only swaps frozen applications. Let the general compressor
++      // spill to the writable Data volume before jetsam reaches backboardd.
++      used = strlen(c->boot_args);
++      if (!has_switch(c->boot_args, "vm_compressor") && sizeof compressor <= sizeof c->boot_args - used) {
++        memcpy(c->boot_args + used, compressor, sizeof compressor);
++        fprintf(stderr, "xnuhost: S25+ general compressor swap enabled\n");
++      }
 +    }
 +  }
 +#endif
    if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
    if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
        !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {
-@@ -652,3 +681,18 @@ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned
+@@ -652,3 +685,18 @@ unsigned xh_scale_fixups(const char *build, unsigned scale, char *list, unsigned
    }
    return length;
  }
@@ -1188,7 +1192,7 @@ index 77d00c6..12755a9 100644
        if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
      } else if (v->type == EV_ABS_ && s->touch) {
 diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
-index 2be908f..f623aab 100644
+index 2be908f..66b027b 100644
 --- a/runtime/xnuhost/src/main.c
 +++ b/runtime/xnuhost/src/main.c
 @@ -163,6 +163,7 @@ static xl_blob sidecar(const char *suffix, size_t limit)
@@ -1273,8 +1277,8 @@ index 2be908f..f623aab 100644
    if (config.scale_fixup)
      config.text_fixups_length = xh_scale_fixups(have_image_set ? image_set.build : NULL, config.scale, config.text_fixups,
                                                  config.text_fixups_length, sizeof config.text_fixups);
-+  // The S25+ Metal runtime needs panel brightness even when backboardd never initializes the plug-in.
-+  if (brightness && have_image_set && (!gpu3d || runtime_metal.data)) {
++  // Route CoreBrightness to the panel even when backboardd never initializes the Metal plug-in.
++  if (brightness && have_image_set) {
 +    unsigned before = config.text_fixups_length;
 +    config.text_fixups_length = xh_backlight_fixup(image_set.build, config.boot_args, config.text_fixups,
 +                                                  before, sizeof config.text_fixups);
@@ -1663,3 +1667,77 @@ index cdd20f1..4dc2361 100644
    ring_count += frames;
    if (ring_count > ostat.fill_max) ostat.fill_max = ring_count;
    pthread_cond_signal(&ring_more);
+diff --git a/runtime/bridges/brightness/brightness.c b/runtime/bridges/brightness/brightness.c
+index ebe3e05..a802984 100644
+--- a/runtime/bridges/brightness/brightness.c
++++ b/runtime/bridges/brightness/brightness.c
+@@ -122,6 +122,7 @@ struct br_bright {
+   uint32_t level;                         // where the fade is now
+   uint64_t started_ms;
+   uint32_t written;                       // the node's value written last
++  unsigned panel_failures;
+   // touch IC (Samsung's sec input class): its power state follows the display's
+   char touch[TOUCH_MAX][200];             // each IC's `enabled` file
+   bool touch_on;                          // the worker's, after open
+@@ -181,7 +182,15 @@ static void panel_write(br_bright *b, uint32_t value)
+   int n = snprintf(text, sizeof text, "%u\n", value);
+   if (value == __atomic_load_n(&b->written, __ATOMIC_RELAXED)) return;
+   if (br_bright_trace) { char plain[16]; snprintf(plain, sizeof plain, "%u", value); br_bright_trace("panel", plain); }
+-  if (pwrite(b->fd, text, (size_t)n, 0) == n) __atomic_store_n(&b->written, value, __ATOMIC_RELAXED);
++  ssize_t count = pwrite(b->fd, text, (size_t)n, 0);
++  if (count == n) {
++    __atomic_store_n(&b->written, value, __ATOMIC_RELAXED);
++    b->panel_failures = 0;
++  } else {
++    int error = count < 0 ? errno : EIO;
++    if ((b->panel_failures++ % 64) == 0)
++      br_log(0, "brightness: panel write %s <- %u: %s", b->info.node, value, strerror(error));
++  }
+ }
+ 
+ // The touch ICs: every <dir>/tsp*/enabled whose input/name is sec_touchscreen. Not the pen (sec_e-pen), not the
+@@ -479,6 +488,15 @@ void br_bright_set(br_bright *b, uint32_t level, bool linear, uint32_t fade_ms)
+   if (level > BR_BRIGHT_FULL) level = BR_BRIGHT_FULL;
+   if (fade_ms > 10000) fade_ms = 10000;
+   pthread_mutex_lock(&b->lock);
++  if (!b->display_on) {
++    // The framebuffer owns display power. Keep a level received while locking for the wake.
++    if (level) {
++      b->lit_level = level;
++      b->lit_linear = linear;
++    }
++    pthread_mutex_unlock(&b->lock);
++    return;
++  }
+   b->from = b->level;
+   b->target = level;
+   b->linear = linear;
+@@ -505,7 +523,7 @@ void br_bright_display(br_bright *b, bool on, const char *why)
+     }
+   } else if (on) {
+     // On (and every repeat of it): the level from before the off, then the IC woken, whatever it was believed to be.
+-    if (!was && b->info.panel && b->target == 0 && b->lit_level) {
++    if (!was && b->info.panel && b->lit_level) {
+       b->from = b->level; b->target = b->lit_level; b->linear = b->lit_linear; b->fade_ms = 0; b->started_ms = now_ms(); b->pending = true;
+     }
+     b->touch_request = TOUCH_WAKE;
+diff --git a/runtime/bridges/brightness/test_brightness.c b/runtime/bridges/brightness/test_brightness.c
+index fb27564..abd7741 100644
+--- a/runtime/bridges/brightness/test_brightness.c
++++ b/runtime/bridges/brightness/test_brightness.c
+@@ -182,11 +182,12 @@ static void test_touch(void)
+     CHECK(trace_is("t:2,0 t:2,1") && get(tsp, "enabled") == 2);
+     br_bright_key(b); usleep(80000);
+     CHECK(trace_is("t:2,0 t:2,1"));
+-    // A level iOS sets while its display is off is taken; the on that follows does not undo it.
++    // A level received while locked takes effect on wake. A trailing off-level cannot replace it.
+     br_bright_set(b, BR_BRIGHT_FULL / 2, true, 0); usleep(80000);
+-    CHECK(trace_is("p:128"));
++    br_bright_set(b, 0, false, 0); usleep(80000);
++    CHECK(trace_is("") && br_bright_current(b) == 1);
+     br_bright_display(b, true, "test"); usleep(80000);
+-    CHECK(trace_is("t:2,0 t:2,1"));
++    CHECK(trace_is("p:128 t:2,0 t:2,1"));
+     // The pen's and the touchpad's nodes were never written.
+     CHECK(get(sec, "tsp_pen/enabled") == 0 && get(sec, "sec_epen/enabled") == 0 && get(sec, "tsp_pad/enabled") == 0);
+     // Closed while the display is off: One UI's level, then the IC awake again (the return).
