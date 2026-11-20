@@ -26,7 +26,7 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           brew install ninja glslang shaderc spirv-tools bison llvm flex uv
           uv venv --python 3.13 "$RUNNER_TEMP/metal-venv"
-          uv pip install --python "$RUNNER_TEMP/metal-venv/bin/python" meson mako pyyaml
+          uv pip install --python "$RUNNER_TEMP/metal-venv/bin/python" meson mako pyyaml packaging
           echo "$RUNNER_TEMP/metal-venv/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
@@ -40,7 +40,29 @@ jobs:
           cargo build --release --locked --manifest-path tools/oneios-tool/Cargo.toml
           bash scripts/fetch/get-ipsw-cli.sh
           bash scripts/fetch/fetch.sh --only systemos profiles/ios-27.0.1-iPhone18,2.toml
-          bash scripts/setup/ios-toolchain.sh --tbd --image inputs/24A446/043-70037-715.dmg
+          mount_dir="$(mktemp -d)"
+          trap 'hdiutil detach -quiet "$mount_dir"; rmdir "$mount_dir"' EXIT
+          hdiutil attach -readonly -nobrowse -noverify -noautoopen -owners off \
+            -imagekey diskimage-class=CRawDiskImage -mountpoint "$mount_dir" inputs/24A446/043-70037-715.dmg
+          cache="$mount_dir/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e"
+          out/bin/ipsw dyld info --dylibs --json "$cache" > "$RUNNER_TEMP/24A446-libraries.json"
+          python3 - "$RUNNER_TEMP/24A446-libraries.json" "$cache" <<'PY'
+          import json
+          import subprocess
+          import sys
+          frameworks = {
+              "Accelerate", "CoreFoundation", "CoreGraphics", "CoreServices", "CoreVideo", "Foundation",
+              "IOKit", "IOSurface", "Metal", "MetalPerformanceShaders", "QuartzCore", "Security",
+          }
+          with open(sys.argv[1]) as f:
+              images = json.load(f)["dylibs"]
+          libraries = []
+          for image in images:
+              name = image["name"]
+              if name.startswith("/usr/lib/") or any("/" + f + ".framework/" in name for f in frameworks):
+                  libraries.append(name)
+          subprocess.run(["python3", "scripts/ios/make-tbds.py", "--cache", sys.argv[2], *libraries], check=True)
+          PY
       - name: Build and verify the Metal bundle
         run: |
           bash userland/metal/build.sh
