@@ -1108,7 +1108,7 @@ index 77d00c6..12755a9 100644
        if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
      } else if (v->type == EV_ABS_ && s->touch) {
 diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
-index 2be908f..ed4ab68 100644
+index 2be908f..ce7152b 100644
 --- a/runtime/xnuhost/src/main.c
 +++ b/runtime/xnuhost/src/main.c
 @@ -163,6 +163,7 @@ static xl_blob sidecar(const char *suffix, size_t limit)
@@ -1119,10 +1119,13 @@ index 2be908f..ed4ab68 100644
  void android_set_application_target_sdk_version(int target);
  #endif
  #include <sys/prctl.h>
-@@ -521,13 +522,42 @@ static int boot(void)
+@@ -521,13 +522,45 @@ static int boot(void)
         kernel.cpusubtype == 2 ? "arm64e" : "arm64", (unsigned long long)kernel.base, kernel.nseg, kernel.nentries);
    if (kernel.cpusubtype == 2 && !(g_info.features & XH_FEATURE_PAC)) { LOGE("an arm64e kernel needs pointer authentication with keys shared across fork; this host has none"); return -1; }
  
++  // Metal eligibility needs the image manifest before the GPU pool is sized.
++  if (image_set_open()) return -1;
++
 +  xl_blob trust = sidecar("trustcache", 16 << 20), addon = sidecar("gpuaddon", 64 << 20);
 +  xl_blob runtime_metal = { 0 };
 +  uint8_t *metal_cdhashes = NULL;
@@ -1163,7 +1166,15 @@ index 2be908f..ed4ab68 100644
    uint64_t media_bytes = strcmp(config.encoder, "off") ? MEDIA_POOL_BYTES : 0;
    uint64_t window = config.ram_bytes - fb_bytes - pool_bytes - media_bytes;
    // 2 MiB host pages for the RAM where this kernel allows them (fix-ram-hugepages; ramfix.c xh_huge_choose): shmem THP
-@@ -816,10 +846,16 @@ static int boot(void)
+@@ -557,7 +590,6 @@ static int boot(void)
+   xh_gic_notify = gic_line;
+   xh_gic_map();
+   xh_uart_init(XL_BOARD_UART);
+-  if (image_set_open()) return -1;
+   for (unsigned i = 0; i < config.ndisk; i++) {
+     xh_blk *disk = xh_blk_open(&config.disk[i], &error);
+     if (!disk) { LOGE("disk %s: %s (%s)", config.disk[i].path, error, strerror(errno)); return -1; }
+@@ -816,10 +848,16 @@ static int boot(void)
    machine.display_height = fb_height;
    machine.display_scale = config.scale;
    machine.display_hz = fb_hz;
@@ -1181,7 +1192,7 @@ index 2be908f..ed4ab68 100644
    if (config.text_fixups_length) {
      machine.text_fixups = config.text_fixups;
      machine.text_fixups_length = config.text_fixups_length;
-@@ -831,11 +867,19 @@ static int boot(void)
+@@ -831,11 +869,19 @@ static int boot(void)
    machine.user_va_limit = xh_tasks_va_limit();
    machine.host_page_size = g_info.host_page_size;
    if (getentropy(machine.random_seed, sizeof machine.random_seed)) { LOGE("no entropy for the kernel's seed"); return -1; }
