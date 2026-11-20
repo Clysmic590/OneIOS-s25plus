@@ -1,0 +1,59 @@
+diff --git a/userland/metal/build.sh b/userland/metal/build.sh
+index 3854bea..e0b80c3 100755
+--- a/userland/metal/build.sh
++++ b/userland/metal/build.sh
+@@ -3,6 +3,7 @@
+ #
+ #   scripts/bg.sh metal userland/metal/build.sh            everything (about 25 minutes the first time)
+ #   userland/metal/build.sh stage|turnip|plugin|finish|addon   one step
++#   ONEIOS_METAL_CLIENT_BLOCK_MIB=32 userland/metal/build.sh   experimental smaller client pools
+ #
+ # What is built (docs/gpu.md section 7, docs/userland.md 7.1):
+ #   libvulkan_freedreno.dylib   Mesa's Turnip (external/mesa-droidvm cecc0e9 + Droid-VM-UniXNU patches/mesa, the list of
+@@ -32,6 +33,11 @@
+ # macOS: brew install ninja glslang shaderc spirv-tools bison llvm (LLVM's tools are found in `brew --prefix llvm`/bin,
+ # Homebrew's bison is put before /usr/bin's 2.3); uv pip install --python "$(command -v python3)" meson mako pyyaml.
+ set -euo pipefail
++export ONEIOS_METAL_CLIENT_BLOCK_MIB=${ONEIOS_METAL_CLIENT_BLOCK_MIB:-}
++case "$ONEIOS_METAL_CLIENT_BLOCK_MIB" in
++  ''|32) ;;
++  *) echo "metal: ONEIOS_METAL_CLIENT_BLOCK_MIB must be empty or 32" >&2; exit 2 ;;
++esac
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ HERE=$ROOT/userland/metal
+ . "$ROOT/scripts/ios/env.sh"
+@@ -92,7 +98,7 @@ EOF
+   local knows=0
+   echo 'int x;' | "$IOS_DIR/ios-clang" -Werror -Wno-error=unused-but-set-global -x c -c - -o /dev/null 2>/dev/null && knows=1
+   python3 - "$R" "$HOOKS" "$JOBS" "$knows" <<'EOF'
+-import json, re, sys
++import json, os, re, sys
+ from pathlib import Path
+ root, hooks, jobs, knows = Path(sys.argv[1]), json.load(open(sys.argv[2])), sys.argv[3], sys.argv[4] == '1'
+ 
+@@ -133,6 +139,17 @@ frontend.write_text(text[:text.index(begin)] + text[text.index(end):])
+ print("metal: staged NativeBridgeMetalFrontend.mm: its supportsFamily: caller block removed; build-adreno-metal-plugin.py inserts the base's (RenderBox, WebGPU, ANGLE)")
+ # The plug-in's shared cache addresses: upstream's are the iPad17,3 24A446 cache's.
+ plugin = root / 'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm'
++block_mib = os.environ['ONEIOS_METAL_CLIENT_BLOCK_MIB']
++if block_mib:
++    # https://github.com/superboyyy/hakios-arm64e-dada/tree/main/gpu2 used smaller
++    # pools for app clients. Smaller render-server blocks caused hangs in Droid-VM.
++    edit('drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm', [
++        ('    boundPooledBlocks();\n    boundClientBoCache();',
++         '    boundPooledBlocks();\n'
++         f'    setenv("METAL2VULKAN_BLOCK_MIB", "{block_mib}", 0);\n'
++         '    boundClientBoCache();',
++         'use smaller pooled blocks for Metal clients, with the existing override taking precedence'),
++    ])
+ text = plugin.read_text()
+ anchor, branch = hooks['anchor'], hooks['branch']
+ for item in [anchor] + hooks['replace']:
+@@ -202,6 +219,7 @@ json.dump({
+     'sdk': {'path': env['IOS_SDK'], 'version': env['IOS_SDK_VERSION']},
+     'stubs': json.load(open(tbd)) if os.path.exists(tbd) else None,
+     'deployment_target': env['IOS_MIN'], 'clang': subprocess.run([env['IOS_CLANG'], '--version'], capture_output=True, text=True).stdout.splitlines()[0],
++    'client_pooled_block_mib': int(env['ONEIOS_METAL_CLIENT_BLOCK_MIB']) if env['ONEIOS_METAL_CLIENT_BLOCK_MIB'] else None,
+     'ld64': env['IOS_LD_VERSION'] or None,
+     'linker': (subprocess.run([env['IOS_LD'], '-v'], capture_output=True, text=True).stderr.splitlines() or [''])[0].strip(),
+     'rustc': subprocess.run(['rustc', '+1.98.0', '--version'], capture_output=True, text=True).stdout.strip(),

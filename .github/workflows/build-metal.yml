@@ -1,6 +1,8 @@
-name: Build OneiOS Metal for 24A446
+name: Build experimental OneiOS 0.1.27 runtime
 on:
   workflow_dispatch:
+  push:
+    branches: [build/runtime-0.1.27]
 permissions:
   actions: read
   contents: read
@@ -12,11 +14,20 @@ jobs:
       run:
         working-directory: runtime-source
     steps:
+      - name: Checkout the OneiOS port patches
+        uses: actions/checkout@v4
+        with:
+          path: port
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: akshaynexus/OneiOS
           ref: 7b81012615f2278460ffa3996aa56d6889277095
           path: runtime-source
+      - name: Apply the per-client Metal pool patch
+        run: |
+          git apply --check ../port/patches/metal-client-pool.patch
+          git apply ../port/patches/metal-client-pool.patch
       - name: Prepare the iPhoneOS and renderer build tools
         run: |
           xcrun --sdk iphoneos --show-sdk-version
@@ -60,6 +71,8 @@ jobs:
           subprocess.run(["python3", "scripts/ios/make-tbds.py", "--cache", sys.argv[2], *libraries], check=True)
           PY
       - name: Build and verify the Metal bundle
+        env:
+          ONEIOS_METAL_CLIENT_BLOCK_MIB: '32'
         run: |
           python3 - <<'PY'
           from pathlib import Path

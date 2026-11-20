@@ -67,6 +67,8 @@ jobs:
           from pathlib import Path
           source = Path("metal")
           record = json.loads((source / "NativeAdrenoMetal.build.json").read_text())
+          if record.get("client_pooled_block_mib") != 32:
+              raise SystemExit("Metal add-on must be built with 32 MiB app-client pools")
           if record["target"] != "iPhone18,2 24A446" or not record["stubs"]:
               raise SystemExit("Metal add-on targets the wrong guest or lacks link validation")
           hashes = [bytes.fromhex(h) for h in record["cdhashes"]]
@@ -88,13 +90,13 @@ jobs:
         env:
           ONEIOS_BUILD_AEA: '1'
           PACKAGE_EXTRA_DIR: ${{ github.workspace }}/metal-stage
-        run: bash runtime/package.sh 0.1.26-s25plusmetal
+        run: bash runtime/package.sh 0.1.27-s25plusmetal
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Metal-Runtime-0.1.26
+          name: OneiOS-S25Plus-Metal-Runtime-0.1.27
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.26-s25plusmetal-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.26-s25plusmetal-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.27-s25plusmetal-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.27-s25plusmetal-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30
