@@ -288,10 +288,10 @@ index e6c7e06..cf07b02 100644
          else -> Finding(GATE_ID, Level.OK, "$NAME: experimental, acknowledged")
      }
 diff --git a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
-index fae14d7..c317db6 100644
+index fae14d7..31a3c25 100644
 --- a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
 +++ b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
-@@ -49,39 +49,53 @@ class OneiosTest {
+@@ -49,39 +49,57 @@ class OneiosTest {
      // --- Where it is offered ---------------------------------------------------
  
      @Test
@@ -343,7 +343,9 @@ index fae14d7..c317db6 100644
 -        assertEquals(Level.WARN, OneiosSystem.gate(null, ticked = true).level)
 -        assertEquals(Level.OK, OneiosSystem.gate(Profiles.F8U, ticked = true, notThisPhoneTicked = true).level)
 -        val ask = OneiosSystem.gate(Profiles.S_ULTRA_8650, ticked = false)
-+        assertTrue(other.detail.contains("Galaxy S25+"))
++        for (model in listOf("SM-S931", "SM-S936", "SM-S938")) {
++            assertTrue(other.detail.contains(model))
++        }
 +        assertEquals(Level.BLOCK, OneiosSystem.gate(null, ticked = true).level)
 +        assertEquals(Level.BLOCK, OneiosSystem.gate(Profiles.S_ULTRA_8650, ticked = true).level)
 +        val ask = OneiosSystem.gate(Profiles.S_8750, ticked = false)
@@ -357,6 +359,8 @@ index fae14d7..c317db6 100644
 +        assertEquals(OneiosSystem.R_EXPERIMENTAL, s25Plus.reason)
 +        assertTrue(s25Plus.detail.contains("experimental"))
 +        assertEquals(Level.OK, OneiosSystem.gate(Profiles.S_PLUS_8750, ticked = true).level)
++        assertEquals(Level.WARN, OneiosSystem.gate(Profiles.S_ULTRA_8750, ticked = false).level)
++        assertEquals(Level.OK, OneiosSystem.gate(Profiles.S_ULTRA_8750, ticked = true).level)
      }
  
      /** It is its own kind of system: no Android image or file set stands for it. */
