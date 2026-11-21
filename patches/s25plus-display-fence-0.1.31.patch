@@ -1,0 +1,258 @@
+diff --git a/runtime/xnuhost/Makefile b/runtime/xnuhost/Makefile
+index 12a3bbd..6677e21 100644
+--- a/runtime/xnuhost/Makefile
++++ b/runtime/xnuhost/Makefile
+@@ -32,7 +32,7 @@ all: $(A)/xnuhost $(A)/gpuctl
+ # the 2D device only and says so at start.
+ VIRGL ?= ../../external/virglrenderer
+ DRM2KGSL_SRC := src/drm/drm2kgsl/drm2kgsl_renderer.c src/drm/drm_context.c src/drm/drm_fence.c src/drm/drm_util.c \
+-                src/virgl_context.c src/virgl_resource.c src/virgl_util.c src/virgl_fence.c \
++                src/virgl_context.c src/virgl_resource.c src/virgl_util.c \
+                 src/gallium/auxiliary/util/u_hash_table.c src/mesa/util/hash_table.c src/mesa/util/ralloc.c \
+                 src/mesa/util/os_file.c src/mesa/util/anon_file.c src/mesa/util/u_debug.c src/mesa/util/u_math.c \
+                 src/mesa/util/u_cpu_detect.c
+@@ -56,6 +56,13 @@ $(A)/drm2kgsl/patched/drm2kgsl_renderer.c: $(VIRGL)/src/drm/drm2kgsl/drm2kgsl_re
+ 	mv $@.tmp $@
+ $(A)/drm2kgsl/drm2kgsl_renderer.o: $(A)/drm2kgsl/patched/drm2kgsl_renderer.c drm2kgsl/config.h
+ 	$(ANDROID_CC) -std=gnu11 -O2 -g -w $(VIRGL_INC) -c $< -o $@
++$(A)/drm2kgsl/patched/drm_fence.c: $(VIRGL)/src/drm/drm_fence.c drm2kgsl/disable-fence-export.patch
++	@mkdir -p $(A)/drm2kgsl/patched
++	cp $< $@.tmp
++	patch -s --no-backup-if-mismatch -F0 $@.tmp < drm2kgsl/disable-fence-export.patch
++	mv $@.tmp $@
++$(A)/drm2kgsl/drm_fence.o: $(A)/drm2kgsl/patched/drm_fence.c drm2kgsl/config.h
++	$(ANDROID_CC) -std=gnu11 -O2 -g -w $(VIRGL_INC) -c $< -o $@
+ $(A)/libdrm2kgsl.a: $(DRM2KGSL_OBJ)
+ 	rm -f $@ && $(TOOLS)/llvm-ar rcs $@ $^
+ $(A)/gpu3d_kgsl.o: src/gpu3d_kgsl.c src/gpu3d.h drm2kgsl/config.h drm2kgsl/oneios_drm2kgsl.h
+@@ -77,18 +84,18 @@ $(A)/gpuctl: tools/gpuctl.c $(A)/gpu3d.o $(GPU3D) src/gpu3d.h
+ ifneq ($(GPU3D),)
+ # drm2kgsl/host_c11.h: mesa's C11 threads shim beside a new glibc
+ HOST_C11 := -include drm2kgsl/host_c11.h
+-$(H)/test_drm2kgsl: tests/test_drm2kgsl.c src/gpu3d.c src/gpu3d_kgsl.c src/gpu3d.h drm2kgsl/oneios_drm2kgsl.h $(A)/drm2kgsl/patched/drm2kgsl_renderer.c
++$(H)/test_drm2kgsl: tests/test_drm2kgsl.c src/gpu3d.c src/gpu3d_kgsl.c src/gpu3d.h drm2kgsl/oneios_drm2kgsl.h $(A)/drm2kgsl/patched/drm2kgsl_renderer.c $(A)/drm2kgsl/patched/drm_fence.c
+ 	@mkdir -p $(H)/drm2kgsl
+-	for f in $(A)/drm2kgsl/patched/drm2kgsl_renderer.c $(addprefix $(VIRGL)/,$(filter-out %/drm2kgsl_renderer.c,$(DRM2KGSL_SRC))); do \
++	for f in $(A)/drm2kgsl/patched/drm2kgsl_renderer.c $(A)/drm2kgsl/patched/drm_fence.c $(addprefix $(VIRGL)/,$(filter-out %/drm2kgsl_renderer.c %/drm_fence.c,$(DRM2KGSL_SRC))); do \
+ 	  $(CC) -std=gnu11 -O1 -g -w -U_FORTIFY_SOURCE $(HOST_C11) $(VIRGL_INC) -c $$f -o $(H)/drm2kgsl/$$(basename $$f .c).o || exit 1; done
+ 	$(CC) -std=gnu11 -O1 -g $(WARN) -Wno-unused-parameter -U_FORTIFY_SOURCE $(HOST_C11) -fsanitize=address,undefined -DXH_DRM2KGSL=1 -Isrc $(VIRGL_INC) \
+-	  tests/test_drm2kgsl.c src/gpu3d.c src/gpu3d_kgsl.c $(H)/drm2kgsl/*.o -Wl,--wrap=ioctl -Wl,--wrap=open -lpthread -lm -o $@
++	  tests/test_drm2kgsl.c src/gpu3d.c src/gpu3d_kgsl.c $(addprefix $(H)/drm2kgsl/,$(notdir $(DRM2KGSL_OBJ))) -Wl,--wrap=ioctl -Wl,--wrap=open -lpthread -lm -o $@
+ TEST_DRM2KGSL := $(H)/test_drm2kgsl
+ # The same renderer through many create/attach/detach/unref cycles, failed blobs and a reset: every fd and KGSL object back, and
+ # LeakSanitizer finding nothing (tests/test_gpu_leaks.c; CYCLES=N for more cycles).
+ $(H)/test_gpu_leaks: tests/test_gpu_leaks.c $(H)/test_drm2kgsl
+ 	$(CC) -std=gnu11 -O1 -g $(WARN) -Wno-unused-parameter -U_FORTIFY_SOURCE $(HOST_C11) -fsanitize=address,undefined -DXH_DRM2KGSL=1 -Isrc $(VIRGL_INC) \
+-	  tests/test_gpu_leaks.c src/gpu3d.c src/gpu3d_kgsl.c $(H)/drm2kgsl/*.o -Wl,--wrap=ioctl -Wl,--wrap=open -lpthread -lm -o $@
++	  tests/test_gpu_leaks.c src/gpu3d.c src/gpu3d_kgsl.c $(addprefix $(H)/drm2kgsl/,$(notdir $(DRM2KGSL_OBJ))) -Wl,--wrap=ioctl -Wl,--wrap=open -lpthread -lm -o $@
+ TEST_GPU_LEAKS := $(H)/test_gpu_leaks
+ endif
+ 
+diff --git a/runtime/xnuhost/drm2kgsl/patches/0007-import-coherence-read-back.patch b/runtime/xnuhost/drm2kgsl/patches/0007-import-coherence-read-back.patch
+index cad1c4e..3821686 100644
+--- a/runtime/xnuhost/drm2kgsl/patches/0007-import-coherence-read-back.patch
++++ b/runtime/xnuhost/drm2kgsl/patches/0007-import-coherence-read-back.patch
+@@ -41,7 +41,7 @@
+ +   g_imports.said[outcome] = true;
+ +   pthread_mutex_unlock(&g_imports.lock);
+ +   if (say)
+-+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "guest import: KGSL %s: asked flags 0x%x, now 0x%" PRIx64 " (cache mode %u)\n", what[outcome],
+++      _drm_log(outcome == 1 || outcome == 3 ? VIRGL_LOG_LEVEL_WARNING : VIRGL_LOG_LEVEL_INFO, "guest import: KGSL %s: asked flags 0x%x, now 0x%" PRIx64 " (cache mode %u)\n", what[outcome],
+ +               kgsl_flags, read ? (uint64_t)info.flags : 0, read ? (unsigned)((info.flags & KGSL_CACHEMODE_MASK) >> KGSL_CACHEMODE_SHIFT) : 0u);
+ +}
+ +
+diff --git a/runtime/xnuhost/drm2kgsl/patches/0008-deadline-level-and-class-priority.patch b/runtime/xnuhost/drm2kgsl/patches/0008-deadline-level-and-class-priority.patch
+index d670898..8ebdc53 100644
+--- a/runtime/xnuhost/drm2kgsl/patches/0008-deadline-level-and-class-priority.patch
++++ b/runtime/xnuhost/drm2kgsl/patches/0008-deadline-level-and-class-priority.patch
+@@ -208,7 +208,7 @@
+     *out_id = req.drawctxt_id;
+ +   static uint32_t logged;
+ +   if (p_atomic_inc_return(&logged) <= 64)
+-+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "queue %u of %.*s: %s, KGSL priority %u%s\n", req.drawctxt_id, (int)sizeof(kctx->oneios_name),
+++      _drm_log(VIRGL_LOG_LEVEL_INFO, "queue %u of %.*s: %s, KGSL priority %u%s\n", req.drawctxt_id, (int)sizeof(kctx->oneios_name),
+ +               kctx->oneios_name[0] ? kctx->oneios_name : "?", og_class_name(kctx->oneios_class),
+ +               (req.flags & KGSL_CONTEXT_PRIORITY_MASK) >> KGSL_CONTEXT_PRIORITY_SHIFT,
+ +               req.flags & KGSL_CONTEXT_PRIORITY_MASK ? "" : " (none asked: the kernel's default)");
+@@ -220,7 +220,7 @@
+           q->id = id;
+           if (constrained)
+ -            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: constrained while it submits at an animation's rate\n", id);
+-+            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: %s\n", id, __atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE)
+++            _drm_log(VIRGL_LOG_LEVEL_INFO, "context %u: %s\n", id, __atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE)
+ +                     ? "a deadline queue: at the top level only for frames that would miss their deadline (xnuhost's policy)"
+ +                     : "constrained while it submits at an animation's rate");
+ +         const bool lowest = kctx->oneios_class == OG_CLASS_BACKGROUND && (!getenv("ONEIOS_GPU_PRIORITY") || strcmp(getenv("ONEIOS_GPU_PRIORITY"), "off"));
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index be0c74c..47de5c6 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -308,7 +308,7 @@ int xh_config_finish(xh_config *c)
+   if (!c->height) c->height = from_image.height;
+   if (!c->hz) c->hz = from_image.hz;
+   if (!c->display_format) c->display_format = from_image.display_format ? from_image.display_format : XH_PIXELS_BGRX8;
+-  if (c->display_direct < 0) c->display_direct = from_image.display_direct < 0 ? 1 : from_image.display_direct;
++  if (c->display_direct < 0) c->display_direct = from_image.display_direct;
+   // The KMS back end scans out 32-bit pixels: half floats only go to a display helper (shm) or nowhere.
+   if (c->display_format == XH_PIXELS_RGBA16F && !strcmp(c->display, "drm")) { fprintf(stderr, "xnuhost: display-format=rgba16f needs --display shm\n"); return -1; }
+   if (!c->scale) c->scale = from_image.scale ? from_image.scale : 3;
+@@ -338,6 +338,10 @@ int xh_config_finish(xh_config *c)
+       fprintf(stderr, "xnuhost: Galaxy S25 built-in HID button routing enabled (%s)\n", model);
+     }
+     if (plus) {
++      if (c->display_direct < 0) {
++        c->display_direct = 0;
++        fprintf(stderr, "xnuhost: S25+ uses the host framebuffer copy by default\n");
++      }
+       c->audio_volume_keys = true;
+       if (!getenv("ONEIOS_AUDIO_LINGER_S")) setenv("ONEIOS_AUDIO_LINGER_S", "15", 0);
+       // Raise the OneOS automatic S25+ cap by one 256 MiB step on a 12 GB phone.
+@@ -357,6 +361,7 @@ int xh_config_finish(xh_config *c)
+     }
+   }
+ #endif
++  if (c->display_direct < 0) c->display_direct = 1;
+   if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
+   if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
+       !exists(c->image, "kernel.macho", c->kernel, sizeof c->kernel)) {
+@@ -364,6 +369,7 @@ int xh_config_finish(xh_config *c)
+     return -1;
+   }
+   if (!*c->identity && !exists(c->image, "identity.adt", c->identity, sizeof c->identity)) c->identity[0] = 0;
++  if (c->display_direct < 0) c->display_direct = 1;
+   if (c->ndisk == 0) {
+     // The image set's volumes (scripts/image/build.sh): read-only APFS containers, in this order.
+     static const char *const names[] = { "os.img", "systemos.img", "app.img" };
+diff --git a/runtime/xnuhost/src/gpu3d_kgsl.c b/runtime/xnuhost/src/gpu3d_kgsl.c
+index 69b41bf..3fc9b8b 100644
+--- a/runtime/xnuhost/src/gpu3d_kgsl.c
++++ b/runtime/xnuhost/src/gpu3d_kgsl.c
+@@ -19,7 +19,6 @@
+ #include <sys/resource.h>
+ 
+ #include "virgl_context.h"
+-#include "virgl_fence.h"
+ #include "virgl_resource.h"
+ #include "virgl_util.h"
+ #include "drm_hw.h"
+@@ -720,8 +719,7 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+   snprintf(reason, sizeof reason, "no memory for the renderer's tables");
+   if (virgl_context_table_init()) goto fail_context;
+   if (virgl_resource_table_init(NULL)) goto fail_resource;
+-  // The sync-file timeline registers its fence fd here. Full virglrenderer initializes this table for its DRM context.
+-  if (virgl_fence_table_init()) goto fail_fence;
++
+   int fd = open(KGSL_DEVICE_NODE, O_RDWR | O_CLOEXEC);
+   k->capset.context_type = VIRTGPU_DRM_CONTEXT_MSM;
+   int r = fd < 0 ? -errno : drm2kgsl_renderer_probe(fd, &k->capset);       // keeps its own descriptor for the VBO
+@@ -746,8 +744,6 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
+   return the;
+ 
+ fail_probe:
+-  virgl_fence_table_cleanup();
+-fail_fence:
+   virgl_resource_table_cleanup();
+ fail_resource:
+   virgl_context_table_cleanup();
+diff --git a/runtime/xnuhost/tests/test_drm2kgsl.c b/runtime/xnuhost/tests/test_drm2kgsl.c
+index 95abc8f..6545154 100644
+--- a/runtime/xnuhost/tests/test_drm2kgsl.c
++++ b/runtime/xnuhost/tests/test_drm2kgsl.c
+@@ -19,6 +19,8 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
++#include <stdatomic.h>
++#include <sys/eventfd.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -31,7 +33,8 @@
+ #include <linux/udmabuf.h>
+ #define __user
+ #include "drm2kgsl/msm_kgsl.h"
+-#include "virgl_fence.h"
++#include "virgl_context.h"
++#include "drm/drm_fence.h"
+ 
+ // ---- the stand-in -----------------------------------------------------------------------------------------------------
+ #define VA_BASE 0x4000000000ull
+@@ -257,17 +260,42 @@ static int guest_buffer(context *c, uint32_t res, uint32_t blob, uint64_t iova,
+ }
+ 
+ // ---- the scenarios ----------------------------------------------------------------------------------------------------
+-static int fence_table(void)
++static atomic_uint completed_fences;
++
++static void fence_completed(struct virgl_context *ctx, uint32_t ring, uint64_t id)
++{
++  if (ring == 1 && id == 1)
++    atomic_fetch_or(&completed_fences, 1u << ctx->ctx_id);
++}
++
++static int separate_fence_timelines(void)
+ {
+   if (!renderer()) { CHECK(false); return 1; }
+-  int fd = __real_open("/dev/null", O_RDONLY | O_CLOEXEC);
+-  CHECK(fd >= 0);
+-  if (fd < 0) return 1;
+-  CHECK(virgl_fence_set_fd(1, fd) == 0);
+-  close(fd);
+-  int exported = virgl_fence_get_fd(1);
+-  CHECK(exported >= 0);
+-  if (exported >= 0) close(exported);
++  struct virgl_context first = { .ctx_id = 1 }, second = { .ctx_id = 2 };
++  struct drm_timeline a = {0}, b = {0};
++  int first_fd = eventfd(0, EFD_CLOEXEC), second_fd = eventfd(0, EFD_CLOEXEC);
++  CHECK(first_fd >= 0 && second_fd >= 0);
++  if (first_fd < 0 || second_fd < 0) return 1;
++  int first_wait = dup(first_fd), second_wait = dup(second_fd);
++  CHECK(first_wait >= 0 && second_wait >= 0);
++  if (first_wait < 0 || second_wait < 0) return 1;
++  drm_timeline_init(&a, &first, "test-fence-a", 1, fence_completed);
++  drm_timeline_init(&b, &second, "test-fence-b", 1, fence_completed);
++  drm_timeline_set_last_fence_fd(&a, first_wait);
++  drm_timeline_set_last_fence_fd(&b, second_wait);
++  CHECK(drm_timeline_submit_fence(&a, 0, 1) == 0);
++  CHECK(drm_timeline_submit_fence(&b, 0, 1) == 0);
++  CHECK(!strstr(last_error, "virgl_fence_set_fd"));
++  CHECK(eventfd_write(second_fd, 1) == 0);
++  for (int i = 0; i < 200 && !atomic_load(&completed_fences); i++) usleep(1000);
++  CHECK(atomic_load(&completed_fences) == (1u << second.ctx_id));
++  CHECK(eventfd_write(first_fd, 1) == 0);
++  for (int i = 0; i < 200 && atomic_load(&completed_fences) != 6; i++) usleep(1000);
++  CHECK(atomic_load(&completed_fences) == 6);
++  drm_timeline_fini(&a);
++  drm_timeline_fini(&b);
++  close(first_fd);
++  close(second_fd);
+   return 0;
+ }
+ 
+@@ -502,7 +530,7 @@ int main(void)
+ {
+   int node = __real_open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   fake_udmabuf = node < 0;
+-  bool ok = scenario("sync-file fence table is ready after renderer setup", fence_table);
++  bool ok = scenario("identical sync-file fence IDs retire on separate contexts", separate_fence_timelines);
+   if (node < 0) {
+     // The scenarios that read the guest's pages need the real one; the policy's run on the stand-in.
+     printf("drm2kgsl on a stand-in KGSL: no /dev/udmabuf here (%s): the memory scenarios skipped, the policy's on a stand-in udmabuf\n",
+diff --git a/runtime/xnuhost/drm2kgsl/disable-fence-export.patch b/runtime/xnuhost/drm2kgsl/disable-fence-export.patch
+new file mode 100644
+--- /dev/null
++++ b/runtime/xnuhost/drm2kgsl/disable-fence-export.patch
+@@ -0,0 +1,13 @@
++--- a/src/drm/drm_fence.c
+++++ b/src/drm/drm_fence.c
++@@ -191,7 +191,9 @@
++          return -ENOMEM;
++ 
++       drm_dbg("fence: %p (%" PRIu64 ")", (void*)fence, fence->fence_id);
++-      virgl_fence_set_fd(fence_id, fence->fd);
+++      /* xnuhost completes fences through this timeline's retire callback.
+++       * The export table is unused here and its global IDs collide when
+++       * different guest contexts submit their own fence sequences. */
++ 
++       close(timeline->last_fence_fd);
++       timeline->last_fence_fd = -1;
