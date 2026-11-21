@@ -1,0 +1,47 @@
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 6b3ee08..d7fae65 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -371,6 +371,14 @@ int xh_config_finish(xh_config *c)
+     if (!has_switch(c->boot_args, "memorystatus_reaper_minimum_age_apps_seconds") &&
+         sizeof reaper_app_age <= sizeof c->boot_args - used)
+       memcpy(c->boot_args + used, reaper_app_age, sizeof reaper_app_age);
++
++    // Give queued touch events, including finger lifts, room while backboardd stalls.
++    static const char hid_queue[] = " oneios-hid-queue-kib=256";
++    const size_t after_reaper = strlen(c->boot_args);
++    if (!has_switch(c->boot_args, "oneios-hid-queue-kib") &&
++        !has_switch(c->boot_args, "hidq_size") &&
++        sizeof hid_queue <= sizeof c->boot_args - after_reaper)
++      memcpy(c->boot_args + after_reaper, hid_queue, sizeof hid_queue);
+   }
+   if (c->display_direct < 0) c->display_direct = 1;
+   if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 98079be..aa7932a 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1841,11 +1841,21 @@ static void test_config(const char *dir)
+   c.s25plus = true;
+   CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "ram-percent", "45") == 0 && xh_config_finish(&c) == 0);
+   CHECK(c.ram_percent == 56 && strstr(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=60"));
++  CHECK(strstr(c.boot_args, "oneios-hid-queue-kib=256") != NULL);
++  const char *custom_hid[] = { "oneios-hid-queue-kib=128", "hidq_size=32768" };
++  for (size_t i = 0; i < sizeof custom_hid / sizeof custom_hid[0]; i++) {
++    xh_config_defaults(&c);
++    c.s25plus = true;
++    CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "boot-args", custom_hid[i]) == 0 &&
++          xh_config_finish(&c) == 0);
++    CHECK(strstr(c.boot_args, custom_hid[i]) != NULL && !strstr(c.boot_args, "oneios-hid-queue-kib=256"));
++  }
+   xh_config_defaults(&c);
+   c.s25plus = true;
+-  CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "boot-args", "memorystatus_reaper_minimum_age_apps_seconds=120") == 0 &&
++  const char *custom_args = "memorystatus_reaper_minimum_age_apps_seconds=120 oneios-hid-queue-kib=128";
++  CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "boot-args", custom_args) == 0 &&
+         xh_config_finish(&c) == 0);
+-  CHECK(!strcmp(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=120"));
++  CHECK(!strcmp(c.boot_args, custom_args));
+   // The owner's boot of 2026-11-15 says the default explicitly: the same.
+   char *ram1e[] = { "xnuhost", "--image", image, "--set", set_meminfo, "--set", "ram-giveback=0", "--set", "ram-prefault=1", "--set", "ram-lock=1" };
+   xh_config_defaults(&c);
