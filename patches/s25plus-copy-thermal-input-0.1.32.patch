@@ -1,0 +1,251 @@
+diff --git a/runtime/bridges/audio/aaudio_helper.c b/runtime/bridges/audio/aaudio_helper.c
+index b7eef89..2eb4b97 100644
+--- a/runtime/bridges/audio/aaudio_helper.c
++++ b/runtime/bridges/audio/aaudio_helper.c
+@@ -946,6 +946,7 @@ int main(int argc, char **argv)
+   buffer_bursts = env_ms("ONEIOS_AUDIO_BURSTS", 0, 1, 8);
+   linger_s = env_ms("ONEIOS_AUDIO_LINGER_S", 60, 0, 600);
+   uclamp_min = env_ms("ONEIOS_AUDIO_UCLAMP", 512, 0, 1024);
++  speaker_gain = env_ms("ONEIOS_AUDIO_INITIAL_GAIN", 100, 0, 100);
+   const char *perf = getenv("ONEIOS_AUDIO_PERF"), *mmap = getenv("ONEIOS_AUDIO_MMAP");
+   perf_mode = perf && !strcmp(perf, "none") ? AAUDIO_PERFORMANCE_MODE_NONE : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
+   mmap_want = !mmap || !*mmap || !strcmp(mmap, "exclusive") ? MMAP_EXCLUSIVE : !strcmp(mmap, "shared") ? MMAP_SHARED : MMAP_OFF;
+@@ -1007,8 +1008,8 @@ int main(int argc, char **argv)
+     }
+     case AU_GAIN_STEP:
+       if (output) {
+-        if (packet.header.value && speaker_gain < 100) speaker_gain += 10;
+-        else if (!packet.header.value && speaker_gain) speaker_gain -= 10;
++        if (packet.header.value && speaker_gain < 100) speaker_gain += speaker_gain <= 90 ? 10 : 100 - speaker_gain;
++        else if (!packet.header.value && speaker_gain) speaker_gain -= speaker_gain >= 10 ? 10 : speaker_gain;
+         fprintf(stderr, "oneios-audio: speaker gain %u%% (volume key)\n", speaker_gain);
+       }
+       break;
+diff --git a/runtime/bridges/thermal/thermal.c b/runtime/bridges/thermal/thermal.c
+index 6f6bc66..3d57072 100644
+--- a/runtime/bridges/thermal/thermal.c
++++ b/runtime/bridges/thermal/thermal.c
+@@ -364,7 +364,7 @@ struct br_thermal {
+   br_thermal_sensors sensors;
+   br_thermal_limits limits;
+   uint32_t poll_ms;
+-  bool cap_off;
++  bool cap_off, early_cpu_cap;
+   pthread_t thread;
+   pthread_mutex_t lock;
+   pthread_cond_t wake;
+@@ -451,6 +451,14 @@ static void say_level(const br_thermal_state *s, const br_thermal_state *was)
+          skin, soc, s->raw.soc_zone[0] ? s->raw.soc_zone : "-", battery);
+ }
+ 
++static unsigned session_cap(const br_thermal *t, const br_thermal_state *s)
++{
++  if (t->cap_off) return 0;
++  if (s->cap) return s->cap;
++  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_TRAPPING ||
++                             s->battery_level >= BR_THERMAL_HEAVY) ? 1 : 0;
++}
++
+ // With the lock held.
+ static void step(br_thermal *t)
+ {
+@@ -458,7 +466,7 @@ static void step(br_thermal *t)
+   sensors_read(t, &raw);
+   br_thermal_state next;
+   br_thermal_decide(&t->limits, &raw, &t->now, &next);
+-  if (t->cap_off) next.cap = 0;
++  next.cap = session_cap(t, &next);
+   if (next.level != t->now.level) say_level(&next, &t->now);
+   t->now = next;
+ }
+@@ -538,13 +546,15 @@ br_thermal *br_thermal_open(const br_thermal_options *options)
+   else { br_thermal_limits_default(&t->limits); if (!options) limits_from_env(&t->limits); }
+   const char *cap = options ? NULL : getenv("ONEIOS_THERMAL_CAP");
+   t->cap_off = cap && !strcmp(cap, "0");
++  const char *early = getenv("ONEIOS_THERMAL_EARLY_CAP");
++  t->early_cpu_cap = options ? options->early_cpu_cap : early && !strcmp(early, "1");
+   t->poll_ms = options && options->poll_ms ? options->poll_ms : BR_THERMAL_POLL_MS;
+   t->load_ms = options && options->load_ms ? options->load_ms : BR_THERMAL_LOAD_MS;
+   br_host_load_read(t->sensors.root, &t->load);
+   br_thermal_raw raw;
+   sensors_read(t, &raw);
+   br_thermal_decide(&t->limits, &raw, NULL, &t->now);
+-  if (t->cap_off) t->now.cap = 0;
++  t->now.cap = session_cap(t, &t->now);
+   t->sent = t->now;
+   t->sent_ms = now_ms();
+   pthread_mutex_init(&t->lock, NULL);
+diff --git a/runtime/bridges/thermal/thermal.h b/runtime/bridges/thermal/thermal.h
+index 2a7ac5a..cb7c9ea 100644
+--- a/runtime/bridges/thermal/thermal.h
++++ b/runtime/bridges/thermal/thermal.h
+@@ -127,6 +127,7 @@ typedef struct {
+   uint32_t poll_ms;                       // 0: BR_THERMAL_POLL_MS
+   const br_thermal_limits *limits;        // NULL: the defaults and ONEIOS_THERMAL_SKIN, _SOC, _BATTERY
+   uint32_t load_ms;                       // 0: BR_THERMAL_LOAD_MS, the "thermal: N s: host CPU" line's period
++  bool     early_cpu_cap;                 // moderate scheduling relief when the case or battery is hot
+   int      backend;                       // BR_HW_SAMSUNG, BR_HW_TREBLE (bridges/hw_backend.h); 0: the process's hw-backend
+   const char *binder;                     // treble: the binder device; NULL: ONEIOS_BINDER, else /dev/binder
+ } br_thermal_options;
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 47de5c6..5c1bbfc 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -338,11 +338,13 @@ int xh_config_finish(xh_config *c)
+       fprintf(stderr, "xnuhost: Galaxy S25 built-in HID button routing enabled (%s)\n", model);
+     }
+     if (plus) {
++      c->s25plus = true;
+       if (c->display_direct < 0) {
+         c->display_direct = 0;
+         fprintf(stderr, "xnuhost: S25+ uses the host framebuffer copy by default\n");
+       }
+       c->audio_volume_keys = true;
++      if (!getenv("ONEIOS_AUDIO_INITIAL_GAIN")) setenv("ONEIOS_AUDIO_INITIAL_GAIN", "70", 0);
+       if (!getenv("ONEIOS_AUDIO_LINGER_S")) setenv("ONEIOS_AUDIO_LINGER_S", "15", 0);
+       // Raise the OneOS automatic S25+ cap by one 256 MiB step on a 12 GB phone.
+       // The fit and host-floor limits still apply below.
+diff --git a/runtime/xnuhost/src/display.c b/runtime/xnuhost/src/display.c
+index 4b1644b..99eab5f 100644
+--- a/runtime/xnuhost/src/display.c
++++ b/runtime/xnuhost/src/display.c
+@@ -494,6 +494,8 @@ int xh_display_init(const xh_config *c, unsigned *width, unsigned *height, unsig
+   display.format = c->display_format ? c->display_format : XH_PIXELS_BGRX8;
+   display.bpp = xh_pixels_bpp(display.format);
+   display.stride = display.width * display.bpp;
++  if (c->s25plus && backend == BACK_SHM && display.format == XH_PIXELS_BGRX8)
++    display.stride = (display.stride + 63u) & ~63u;    // match the compositor's BGRA row alignment
+   if (backend == BACK_SHM) {
+     if (shm_frame()) { LOGE("display: shared frame: %s", strerror(errno)); return -1; }
+   } else {
+diff --git a/runtime/xnuhost/src/input.c b/runtime/xnuhost/src/input.c
+index d35dd35..a071b8d 100644
+--- a/runtime/xnuhost/src/input.c
++++ b/runtime/xnuhost/src/input.c
+@@ -206,7 +206,7 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+         s->dropping = true;
+         continue;
+       }
+-      if (v->code != SYN_REPORT_) continue;
++      if (v->code != SYN_REPORT_ || !s->touch) continue;
+       if (s->touch) send_event(s, EV_MSC_, MSC_TIMESTAMP_, (int32_t)scan_ticks(v->time_ns, now_ns, now_counter, hz));
+       send_event(s, EV_SYN_, SYN_REPORT_, 0);
+       if (s->touch) count_frame(s, v->time_ns, now_ns);
+@@ -220,7 +220,11 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+           LOGI("input: %s: first side-button press (Linux key %u), forwarding to virtio-input", s->name, v->code);
+         }
+       }
+-      if (side || (s->touch && v->code == BTN_TOUCH_)) send_event(s, EV_KEY_, v->code, v->value);
++      if (side) {
++        if (v->code == KEY_POWER_ && v->value == 2) continue;
++        send_event(s, EV_KEY_, v->code, v->value);
++        if (!s->touch) send_event(s, EV_SYN_, SYN_REPORT_, 0);
++      } else if (s->touch && v->code == BTN_TOUCH_) send_event(s, EV_KEY_, v->code, v->value);
+       if (v->code == KEY_VOLUMEDOWN_ || v->code == KEY_VOLUMEUP_) volume_event(v->code, v->value);
+       if (v->code == KEY_POWER_ && v->value == 1 && xh_input_power_key) xh_input_power_key();
+     } else if (v->type == EV_ABS_ && s->touch) {
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 8faeb64..abc0382 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -364,10 +364,12 @@ static int vcpu_tid(unsigned vcpu) { return vcpu < g_ncpu ? g_vcpu[vcpu].tid : 0
+ // The thermal bridge's step (br_thermal_cap_for): the vCPUs and the iOS threads they run keep to fewer, slower cores
+ // while the phone is hot. Affinities of xnuhost's own threads and its tasks' only: they end with the session, nothing
+ // outside the process is written, so a SIGKILL leaves nothing to restore.
++static unsigned cpu_thermal_step;
+ static void thermal_step(void *ctx, const br_thermal_state *state)
+ {
+   (void)ctx;
+   if (!cpu_planned) return;
++  __atomic_store_n(&cpu_thermal_step, state->cap, __ATOMIC_RELAXED);
+   br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, state->cap);
+   __atomic_fetch_add(&xh_cpu_place_epoch, 1, __ATOMIC_ACQ_REL);
+   for (unsigned i = 0; i < cpu_plan.nvcpu; i++) { int tid = vcpu_tid(i); if (tid > 0) place(tid, i); }
+@@ -431,7 +433,9 @@ static unsigned vcpu_uclamp(unsigned vcpu)
+     unsigned asked = br_cpu_util_for(&cpu_plan, vcpu, br_cpufreq_requested(cpu_freq, vcpu));
+     if (asked > want) want = asked;
+   }
+-  return want > 1024 ? 1024 : want;
++  // When warm, reduce the minimum clock request. Linux may still raise the clock for real load.
++  unsigned ceiling = config.s25plus && __atomic_load_n(&cpu_thermal_step, __ATOMIC_RELAXED) ? 640 : 1024;
++  return want > ceiling ? ceiling : want;
+ }
+ static uint64_t cpufreq_read(void *opaque, uint64_t offset, unsigned size) { return br_cpufreq_read(opaque, offset, size); }
+ static void cpufreq_write(void *opaque, uint64_t offset, unsigned size, uint64_t value) { br_cpufreq_write(opaque, offset, size, value); }
+@@ -746,6 +750,7 @@ static int boot(void)
+     brightness = br_bright_open(NULL);
+     if (brightness) xh_input_power_key = power_key_pressed;        // the touch IC is woken at each press
+     battery = br_battery_open(NULL);
++    if (config.s25plus) setenv("ONEIOS_THERMAL_EARLY_CAP", "1", 0);
+     thermal = br_thermal_open(NULL);
+     if (thermal) br_thermal_on_cap(thermal, thermal_step, NULL);
+     br_bridge_config bridge = { .haptic = haptic, .hci_factory = hidl ? br_hci_open_hidl : sim ? br_hci_open_sim : NULL,
+diff --git a/runtime/xnuhost/src/virtio_gpu.c b/runtime/xnuhost/src/virtio_gpu.c
+index 533d842..283d62c 100644
+--- a/runtime/xnuhost/src/virtio_gpu.c
++++ b/runtime/xnuhost/src/virtio_gpu.c
+@@ -348,7 +348,15 @@ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
+   uint64_t seg_start = 0;                            // the blob offset at which entries[seg] begins
+   unsigned mapped_seg = b->nentries;
+   const uint8_t *mapped = NULL;
+-  for (uint32_t y = 0; y < hgt && w && status == RESP_OK_NODATA; y++) {
++  // A full-width BGRA frame with matching strides can be copied in guest backing segments.
++  // Include intermediate row padding and omit the last row's padding, which the blob may omit.
++  if (!clipped.x && w == d->width && dformat == XH_PIXELS_BGRX8 &&
++      (g->scan.format == FMT_BGRA || g->scan.format == FMT_BGRX) && g->scan.stride == d->stride) {
++    uint64_t start = g->scan.offset + (uint64_t)clipped.y * d->stride;
++    uint64_t bytes = (uint64_t)(hgt - 1u) * d->stride + (uint64_t)w * 4u;
++    uint8_t *to = d->pixels + (size_t)clipped.y * d->stride;
++    if (!blob_read(b, start, to, bytes)) status = RESP_ERR_INVALID_PARAMETER;
++  } else for (uint32_t y = 0; y < hgt && status == RESP_OK_NODATA; y++) {
+     uint64_t at = g->scan.offset + (uint64_t)(rect->y + y) * g->scan.stride + (uint64_t)rect->x * gbpp, left = (uint64_t)w * gbpp;
+     uint8_t *to = d->pixels + (size_t)(rect->y + y) * d->stride + (size_t)rect->x * dbpp;
+     uint8_t carry[8];                                // a pixel split between two segments
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index a5ac873..b260fd2 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -101,6 +101,7 @@ typedef struct {
+   bool  input;              // read /dev/input
+   bool  touch_sleep;        // touch-sleep=0: the brightness bridge never puts the touch IC to sleep (ONEIOS_TSP_OFF=0)
+   bool  audio_volume_keys;
++  bool  s25plus;
+   char  input_script[512];  // a file of scripted touches and keys (input_script.c), "" = none
+   char  pen[8];             // pen=off (the default until a phone session proves it) | auto: the host's pen digitizer (pen.c,
+                             // xh_pen_lookup) or the script's pen as the guest's pen device /arm-io/input-1, and oneios-pen=1
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 0adbedf..6a3cfb2 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -848,6 +848,21 @@ static void test_virtio_gpu3d(void)
+   CHECK(flush_rect[0] == 1 && flush_rect[1] == 2 && flush_rect[2] == 3 && flush_rect[3] == 2);
+   const uint8_t *px = fake_display.pixels + 2 * 32 + 1 * 4;
+   CHECK(px[0] == 21 && px[1] == 0x20 && px[2] == 0x10 && fake_display.pixels[3 * 32 + 3 * 4] == 33 && fake_display.pixels[0] == 0 && fake_display.pixels[2 * 32 + 4 * 4] == 0);
++  // The padded host buffer can copy contiguous backing and leaves the final row's padding alone.
++  {
++    xh_display original = fake_display;
++    fake_display = (xh_display){ .width = 8, .height = 4, .stride = 40, .format = XH_PIXELS_BGRX8, .bpp = 4,
++                                 .pixels = calloc(4, 40) };
++    CHECK(fake_display.pixels);
++    if (fake_display.pixels) {
++      CLEAR(); cmd[0] = 0x104; cmd[7] = 1; cmd[8] = 8; cmd[9] = 3; cmd[10] = 20;
++      CHECK(G(12, 24) == 1 && resp[0] == 0x1100);
++      CHECK(!memcmp(fake_display.pixels + 40, pixels + 10, 112));
++      CHECK(fake_display.pixels[0] == 0 && fake_display.pixels[152] == 0);
++      free(fake_display.pixels);
++    }
++    fake_display = original;
++  }
+   // a helper that copies the frame itself: the flush is handed over, not copied here, and answered when it says so
+   fake_direct = true;
+   memset(fake_display.pixels, 0, 4 * 32);
+@@ -1266,7 +1281,8 @@ static void test_input_filter(void)
+   xh_input_feed(&k, press, 5, now, counter, hz);
+   CHECK(power_presses == 1);                                                    // the press, not the release below
+   n = input_take(&d, got, 32);
+-  CHECK(n == 3 && got[0].code == 116 && got[0].value == 1 && got[1].code == 172 && got[2].type == 0 && k.sent_keys == 4);
++  CHECK(n == 4 && got[0].code == 116 && got[0].value == 1 && got[1].type == 0 &&
++        got[2].code == 172 && got[3].type == 0 && k.sent_keys == 4);
+   fake_state.keys = 2;                                                          // power up, volume up down: both changed
+   const xh_input_ev kdrop[] = { { now, 0, 3, 0 }, { now, 1, 116, 0 }, { now, 0, 0, 0 } };
+   xh_input_feed(&k, kdrop, 3, now, counter, hz);
