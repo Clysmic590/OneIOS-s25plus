@@ -1,0 +1,75 @@
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 764209f..6289186 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -10,9 +10,9 @@
+ #include <unistd.h>
+ #ifdef __ANDROID__
+ #include <sys/system_properties.h>
++#endif
+ 
+ static bool has_switch(const char *args, const char *name);
+-#endif
+ 
+ void xh_config_defaults(xh_config *c)
+ {
+@@ -363,6 +363,15 @@ int xh_config_finish(xh_config *c)
+     }
+   }
+ #endif
++  if (c->s25plus) {
++    // Keep XNU's eligibility rules and pressure threshold. Idle apps can be
++    // reclaimed sooner, with separate default aging for system processes.
++    static const char reaper_app_age[] = " memorystatus_reaper_minimum_age_apps_seconds=60";
++    const size_t used = strlen(c->boot_args);
++    if (!has_switch(c->boot_args, "memorystatus_reaper_minimum_age_apps_seconds") &&
++        sizeof reaper_app_age <= sizeof c->boot_args - used)
++      memcpy(c->boot_args + used, reaper_app_age, sizeof reaper_app_age);
++  }
+   if (c->display_direct < 0) c->display_direct = 1;
+   if (c->ndisk == 0) { memcpy(c->disk, from_image.disk, sizeof c->disk); c->ndisk = from_image.ndisk; }
+   if (!*c->kernel && !exists(c->image, "kernel.kc", c->kernel, sizeof c->kernel) &&
+@@ -400,9 +409,9 @@ int xh_config_finish(xh_config *c)
+   // The guest's RAM: the command line's ram=, else the image set's, else auto.
+   if (!c->ram_given && from_image.ram_given) c->ram_bytes = from_image.ram_bytes;
+   if (c->ram_percent < 0) c->ram_percent = from_image.ram_percent < 0 ? XH_RAM_AUTO_PERCENT : from_image.ram_percent;
+-  // This phone's OneOS automatic profile starts at 45%. The fit rounds 52% to
+-  // 5632 MiB, one step above the previous 5376 MiB, when the host has room.
+-  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 52;
++  // This phone's OneOS automatic profile starts at 45%. The fit rounds 54% to
++  // 5888 MiB, one step above the previous 5632 MiB, when the host has room.
++  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 54;
+   if (c->ram_host_floor < 0) c->ram_host_floor = from_image.ram_host_floor < 0 ? (int64_t)XH_RAM_AUTO_FLOOR : from_image.ram_host_floor;
+   if (c->host_mem_log < 0) c->host_mem_log = from_image.host_mem_log < 0 ? 30 : from_image.host_mem_log;
+   if (c->usb_log < 0) c->usb_log = from_image.usb_log < 0 ? 3 : from_image.usb_log;
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 8cbab5b..3530fe8 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1785,8 +1785,8 @@ static void test_config(const char *dir)
+   // 552 - 256 = 841 MiB of MemAvailable, the valve's 256 MiB and 585 MiB more for what else grows (that session's growth
+   // outside the guest besides page tables and zram was about 300-350 MiB [estimate from its meminfo]).
+   CHECK(8561 * M - 6912 * M - 6912 * M * PT / 100 - GR > XH_RAM_UNLOCK_BELOW + 512 * M);
+-  CHECK(xh_ram_fit_auto(11113 * M, 52, XH_RAM_AUTO_FLOOR, 7322 * M, NULL) == 5632 * M);
+-  CHECK(xh_ram_fit_auto(11113 * M, 52, XH_RAM_AUTO_FLOOR, 5380 * M, NULL) == 5376 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 54, XH_RAM_AUTO_FLOOR, 7322 * M, NULL) == 5888 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 54, XH_RAM_AUTO_FLOOR, 5380 * M, NULL) == 5376 * M);
+   char set_meminfo[340], set_small[340], set_none[340];
+   snprintf(set_meminfo, sizeof set_meminfo, "ram-meminfo=%s", meminfo);
+   snprintf(set_small, sizeof set_small, "ram-meminfo=%s", small);
+@@ -1811,6 +1811,15 @@ static void test_config(const char *dir)
+         c.ram_session_reserve == (int64_t)XH_RAM_SESSION_RESERVE_LOCKED && c.ram_fit / M == 5688 && c.ram_giveback == 0 && c.ram_lock == 1);
+   CHECK(c.ram_lock_fit == 5632 * M && c.ram_huge == 1);                         // the locked size that fits; 2 MiB pages asked
+   CHECK(xh_config_set(&c, "ram-huge", "0") == 0 && c.ram_huge == 0 && xh_config_set(&c, "ram-huge", "x") != 0);
++  xh_config_defaults(&c);
++  c.s25plus = true;
++  CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "ram-percent", "45") == 0 && xh_config_finish(&c) == 0);
++  CHECK(c.ram_percent == 54 && strstr(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=60"));
++  xh_config_defaults(&c);
++  c.s25plus = true;
++  CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "boot-args", "memorystatus_reaper_minimum_age_apps_seconds=120") == 0 &&
++        xh_config_finish(&c) == 0);
++  CHECK(!strcmp(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=120"));
+   // The owner's boot of 2026-11-15 says the default explicitly: the same.
+   char *ram1e[] = { "xnuhost", "--image", image, "--set", set_meminfo, "--set", "ram-giveback=0", "--set", "ram-prefault=1", "--set", "ram-lock=1" };
+   xh_config_defaults(&c);
