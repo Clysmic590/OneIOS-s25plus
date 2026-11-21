@@ -1,0 +1,404 @@
+diff --git a/runtime/bridges/audio/aaudio_helper.c b/runtime/bridges/audio/aaudio_helper.c
+index 2eb4b97..be453aa 100644
+--- a/runtime/bridges/audio/aaudio_helper.c
++++ b/runtime/bridges/audio/aaudio_helper.c
+@@ -114,7 +114,7 @@ static int out_path;                             // the speaker stream's path
+ static bool continuous;                          // its reader (the DSP, AAudio's endpoint) takes frames all the time
+ static unsigned uclamp_min = 512;                // ONEIOS_AUDIO_UCLAMP (0..1024; 0: none)
+ static unsigned told_frames;                     // the output latency iOS was told (AU_TOLD; 0: not known)
+-static unsigned speaker_gain = 100;              // physical volume keys, before PCM enters the ring
++static atomic_uint speaker_gain = 100;           // physical volume keys, applied as PCM leaves the ring
+ 
+ // ---- the speaker ring (guarded by ring_lock) ----------------------------------------------------
+ static int16_t ring[RING_FRAMES * 2];
+@@ -709,6 +709,10 @@ static void *writer(void *arg)
+     if (aim != fitted) { fitted = aim; buffer_fit(d, aim); }
+     if (play) {
+       resample(chunk, length, from, take);
++      unsigned gain = atomic_load_explicit(&speaker_gain, memory_order_relaxed);
++      if (gain < 100)
++        for (unsigned i = 0; i < length * 2; i++)
++          chunk[i] = (int16_t)(chunk[i] * (int)gain / 100);
+       double stall_since = now_s();
+       for (unsigned done = 0; done < length && atomic_load(&d->run);) {
+         aaudio_result_t n = AAudioStream_write(d->stream, chunk + 2 * done, (int32_t)(length - done), 200000000);   // 200 ms
+@@ -866,8 +870,8 @@ static void put_pcm(const int16_t *pcm, unsigned frames)
+   for (unsigned i = 0; i < frames; i++) {
+     unsigned at = (ring_head + ring_count + i) % RING_FRAMES;
+     int left = pcm[2 * i], right = pcm[2 * i + 1];
+-    ring[2 * at] = (int16_t)(speaker_gain == 100 ? left : left * (int)speaker_gain / 100);
+-    ring[2 * at + 1] = (int16_t)(speaker_gain == 100 ? right : right * (int)speaker_gain / 100);
++    ring[2 * at] = (int16_t)left;
++    ring[2 * at + 1] = (int16_t)right;
+     unsigned mag_left = (unsigned)abs(left), mag_right = (unsigned)abs(right);
+     if (mag_left > peak) peak = mag_left;
+     if (mag_right > peak) peak = mag_right;
+@@ -1008,9 +1012,11 @@ int main(int argc, char **argv)
+     }
+     case AU_GAIN_STEP:
+       if (output) {
+-        if (packet.header.value && speaker_gain < 100) speaker_gain += speaker_gain <= 90 ? 10 : 100 - speaker_gain;
+-        else if (!packet.header.value && speaker_gain) speaker_gain -= speaker_gain >= 10 ? 10 : speaker_gain;
+-        fprintf(stderr, "oneios-audio: speaker gain %u%% (volume key)\n", speaker_gain);
++        unsigned gain = atomic_load_explicit(&speaker_gain, memory_order_relaxed);
++        if (packet.header.value) gain = gain <= 90 ? gain + 10 : 100;
++        else gain = gain >= 10 ? gain - 10 : 0;
++        atomic_store_explicit(&speaker_gain, gain, memory_order_relaxed);
++        fprintf(stderr, "oneios-audio: speaker gain %u%% (volume key)\n", gain);
+       }
+       break;
+     case AU_PROBE: {
+diff --git a/runtime/bridges/brightness/brightness.c b/runtime/bridges/brightness/brightness.c
+index a802984..20525fa 100644
+--- a/runtime/bridges/brightness/brightness.c
++++ b/runtime/bridges/brightness/brightness.c
+@@ -534,12 +534,14 @@ void br_bright_display(br_bright *b, bool on, const char *why)
+          on ? ": the touch IC woken" : b->touch_sleep ? ": the touch IC asleep, the panel at its floor" : ": the panel at its floor (touch-sleep=0)");
+ }
+ 
+-void br_bright_key(br_bright *b)
++void br_bright_key(br_bright *b, bool only_asleep)
+ {
+   if (!b || !b->info.touch_nodes) return;
+   pthread_mutex_lock(&b->lock);
+-  b->touch_request = TOUCH_WAKE;            // iOS turns the display on or off next; an off sleeps it again
+-  pthread_cond_signal(&b->wake);
++  if (!only_asleep || !b->display_on) {
++    b->touch_request = TOUCH_WAKE;
++    pthread_cond_signal(&b->wake);
++  }
+   pthread_mutex_unlock(&b->lock);
+ }
+ 
+diff --git a/runtime/bridges/brightness/brightness.h b/runtime/bridges/brightness/brightness.h
+index 2159ab2..a71a91c 100644
+--- a/runtime/bridges/brightness/brightness.h
++++ b/runtime/bridges/brightness/brightness.h
+@@ -98,7 +98,7 @@ void br_bright_set(br_bright *b, uint32_t level, bool linear, uint32_t fade_ms);
+ // when nothing has set another, then the IC woken. A level of 0 alone does neither: it is a dim panel, not an off one.
+ void br_bright_display(br_bright *b, bool on, const char *why);
+ // A press of the power key (xnuhost's evdev reader): the touch IC woken; iOS's display off that may follow sleeps it.
+-void br_bright_key(br_bright *b);
++void br_bright_key(br_bright *b, bool only_asleep);
+ // The node's value written last (the saved one before the first set).
+ uint32_t br_bright_current(br_bright *b);
+ // Where the panel is now on the slider's scale (the squared curve undone), 0..BR_BRIGHT_FULL.
+diff --git a/runtime/bridges/brightness/test_brightness.c b/runtime/bridges/brightness/test_brightness.c
+index abd7741..1deeb17 100644
+--- a/runtime/bridges/brightness/test_brightness.c
++++ b/runtime/bridges/brightness/test_brightness.c
+@@ -175,12 +175,14 @@ static void test_touch(void)
+     CHECK(trace_is("p:255 t:2,0 t:2,1") && get(tsp, "enabled") == 2);
+     br_bright_display(b, true, "test"); usleep(80000);
+     CHECK(trace_is("t:2,0 t:2,1"));
+-    // A power-key press wakes the IC whatever it is believed to be (the phone's 2026-11-13 key press found it off).
++    // The S25+ lock press leaves the touch controller alone, but its wake press still wakes it.
++    br_bright_key(b, true); usleep(80000);
++    CHECK(trace_is(""));
+     br_bright_display(b, false, "test"); usleep(80000);
+     CHECK(trace_is("t:1,0 t:1,1 p:1"));
+-    br_bright_key(b); usleep(80000);
++    br_bright_key(b, true); usleep(80000);
+     CHECK(trace_is("t:2,0 t:2,1") && get(tsp, "enabled") == 2);
+-    br_bright_key(b); usleep(80000);
++    br_bright_key(b, false); usleep(80000);
+     CHECK(trace_is("t:2,0 t:2,1"));
+     // A level received while locked takes effect on wake. A trailing off-level cannot replace it.
+     br_bright_set(b, BR_BRIGHT_FULL / 2, true, 0); usleep(80000);
+@@ -387,7 +389,7 @@ static void test_treble(void)
+     br_bright_display(b, true, "test");
+     usleep(100000);
+     CHECK(get(qcom, "brightness") == 4095);
+-    br_bright_key(b);                                                // nothing to wake
++    br_bright_key(b, false);                                                // nothing to wake
+     br_bright_close(b);
+     CHECK(get(qcom, "brightness") == 2000 && get(other, "brightness") == 9000);   // One UI's value back; Samsung's node untouched
+   }
+diff --git a/runtime/bridges/thermal/thermal.c b/runtime/bridges/thermal/thermal.c
+index 3d57072..78b5e37 100644
+--- a/runtime/bridges/thermal/thermal.c
++++ b/runtime/bridges/thermal/thermal.c
+@@ -455,8 +455,8 @@ static unsigned session_cap(const br_thermal *t, const br_thermal_state *s)
+ {
+   if (t->cap_off) return 0;
+   if (s->cap) return s->cap;
+-  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_TRAPPING ||
+-                             s->battery_level >= BR_THERMAL_HEAVY) ? 1 : 0;
++  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_HEAVY ||
++                             s->battery_level >= BR_THERMAL_HEAVY || s->soc_level >= BR_THERMAL_TRAPPING) ? 1 : 0;
+ }
+ 
+ // With the lock held.
+diff --git a/runtime/xnuhost/drm2kgsl/oneios_gpu_policy.h b/runtime/xnuhost/drm2kgsl/oneios_gpu_policy.h
+index 38ec41d..5cbf516 100644
+--- a/runtime/xnuhost/drm2kgsl/oneios_gpu_policy.h
++++ b/runtime/xnuhost/drm2kgsl/oneios_gpu_policy.h
+@@ -188,6 +188,12 @@ struct og_policy {
+   uint64_t lowest_undone;   // other work that ended a background lowest level with the top (og_frame_start)
+ };
+ 
++static inline bool og_touch_wake_due(uint64_t touch, uint64_t now, uint64_t last, bool warm)
++{
++  return !warm && touch > last && now >= touch && now - touch <= 120000000ull &&
++         (!last || now - last >= 750000000ull);
++}
++
+ struct og_frame { uint8_t level, cold; uint32_t budget_us; };   // what a frame was given, for og_frame_done
+ 
+ static inline void og_policy_init(struct og_policy *p, enum og_mode mode)
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 5c1bbfc..79bc56a 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -112,7 +112,7 @@ int xh_config_set(xh_config *c, const char *key, const char *value)
+   }
+   else if (!strcmp(key, "gpu")) { ok = !strcmp(value, "auto") || !strcmp(value, "3d") || !strcmp(value, "2d"); if (ok) return copy(c->gpu, sizeof c->gpu, value); }
+   else if (!strcmp(key, "gpu-level")) {
+-    ok = !strcmp(value, "deadline") || !strcmp(value, "hold") || !strcmp(value, "governor");
++    ok = !strcmp(value, "deadline") || !strcmp(value, "hold") || !strcmp(value, "governor") || !strcmp(value, "touch-wake");
+     if (ok) return copy(c->gpu_level, sizeof c->gpu_level, value);
+   }
+   else if (!strcmp(key, "gpu-priority")) { ok = number(value, 0, 1, &c->gpu_priority); }
+@@ -346,10 +346,7 @@ int xh_config_finish(xh_config *c)
+       c->audio_volume_keys = true;
+       if (!getenv("ONEIOS_AUDIO_INITIAL_GAIN")) setenv("ONEIOS_AUDIO_INITIAL_GAIN", "70", 0);
+       if (!getenv("ONEIOS_AUDIO_LINGER_S")) setenv("ONEIOS_AUDIO_LINGER_S", "15", 0);
+-      // Raise the OneOS automatic S25+ cap by one 256 MiB step on a 12 GB phone.
+-      // The fit and host-floor limits still apply below.
+-      if (c->ram_bytes == 0 && c->ram_percent == 45)
+-        c->ram_percent = 48;
++
+       // The S25+ exclusive stream stopped accepting frames while iOS was still producing them.
+       if (!getenv("ONEIOS_AUDIO_MMAP") && !setenv("ONEIOS_AUDIO_MMAP", "off", 0))
+         fprintf(stderr, "xnuhost: S25+ speaker uses the Android mixer by default\n");
+@@ -400,6 +397,9 @@ int xh_config_finish(xh_config *c)
+   // The guest's RAM: the command line's ram=, else the image set's, else auto.
+   if (!c->ram_given && from_image.ram_given) c->ram_bytes = from_image.ram_bytes;
+   if (c->ram_percent < 0) c->ram_percent = from_image.ram_percent < 0 ? XH_RAM_AUTO_PERCENT : from_image.ram_percent;
++  // OneOS's S25+ profile starts at 45%. On this phone, 50% rounds to 5376 MiB,
++  // one 256 MiB step above the previous 5120 MiB. The host-fit limits still apply.
++  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 50;
+   if (c->ram_host_floor < 0) c->ram_host_floor = from_image.ram_host_floor < 0 ? (int64_t)XH_RAM_AUTO_FLOOR : from_image.ram_host_floor;
+   if (c->host_mem_log < 0) c->host_mem_log = from_image.host_mem_log < 0 ? 30 : from_image.host_mem_log;
+   if (c->usb_log < 0) c->usb_log = from_image.usb_log < 0 ? 3 : from_image.usb_log;
+diff --git a/runtime/xnuhost/src/gpu3d.c b/runtime/xnuhost/src/gpu3d.c
+index 45bf29a..e17af42 100644
+--- a/runtime/xnuhost/src/gpu3d.c
++++ b/runtime/xnuhost/src/gpu3d.c
+@@ -13,6 +13,9 @@
+ 
+ #define MAX_BYTES (64ull << 20)       // the kernel's defaults; a host that allows more is not given more
+ #define MAX_RUNS  1024u
++unsigned xh_cpu_thermal_step;
++uint64_t xh_gpu_touch_ns;
++
+ static uint64_t limit_bytes;
+ static unsigned limit_runs;
+ 
+diff --git a/runtime/xnuhost/src/gpu3d.h b/runtime/xnuhost/src/gpu3d.h
+index 3509b77..8b095b9 100644
+--- a/runtime/xnuhost/src/gpu3d.h
++++ b/runtime/xnuhost/src/gpu3d.h
+@@ -10,6 +10,8 @@
+ #include <stdint.h>
+ 
+ typedef struct xh_virtio xh_virtio;
++extern unsigned xh_cpu_thermal_step;
++extern uint64_t xh_gpu_touch_ns;
+ 
+ // A guest memory segment of a HOST3D_GUEST blob: guest physical address and length (virtio_gpu_mem_entry).
+ typedef struct { uint64_t addr; uint32_t length, pad; } xh_gpu_entry;
+diff --git a/runtime/xnuhost/src/gpu3d_kgsl.c b/runtime/xnuhost/src/gpu3d_kgsl.c
+index 3fc9b8b..9b6fc03 100644
+--- a/runtime/xnuhost/src/gpu3d_kgsl.c
++++ b/runtime/xnuhost/src/gpu3d_kgsl.c
+@@ -139,6 +139,8 @@ static struct {
+   struct og_policy pol;
+   const char *background, *front;           // the name lists (NULL: the policy's defaults)
+   uint64_t lowest_n, said_frames, said_top, said_ups, said_downs, said_misses, said_late, said_lowest, said_refused, said_undone;
++  bool touch_wake;
++  uint64_t last_touch_wake_ns;
+   bool priority_on;                         // gpu-priority=1: background queues can carry KGSL's lowest level (patch 0008)
+   uint32_t fg_pending;                      // fences of non-background contexts not yet retired (og_lowest_for)
+   struct og_pages pages;                    // whose surfaces another process reads (og_pages_note)
+@@ -371,6 +373,7 @@ static int submit(xh_gpu3d *b, uint32_t id, const void *commands, size_t size)
+   if (!ctx || (size & 3)) return -EINVAL;
+   // The level for this work, before it reaches KGSL (drm2kgsl/oneios_gpu_policy.h): a frame of the render server, or of a
+   // foreground context within a second of one, gets the top level only if it would miss its deadline at the governor's clock.
++  bool wake = false;
+   if (has_gem_submit(commands, size)) {
+     pthread_mutex_lock(&st.lock);
+     stat_ctx *c = stat_find(id);
+@@ -380,6 +383,12 @@ static int submit(xh_gpu3d *b, uint32_t id, const void *commands, size_t size)
+       uint64_t now = now_us() * 1000u;
+       action = og_frame_start(&st.pol, c->cls, now, (uint32_t)c->hint[2] * OG_HINT_DEADLINE_US, &c->next);
+       c->has_next = c->next.budget_us != 0;
++      if (st.touch_wake && c->cls == OG_CLASS_RENDER) {
++        const uint64_t touch = __atomic_load_n(&xh_gpu_touch_ns, __ATOMIC_RELAXED);
++        const bool warm = __atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED) != 0;
++        wake = og_touch_wake_due(touch, now, st.last_touch_wake_ns, warm);
++        if (wake) st.last_touch_wake_ns = now;
++      }
+       lowest_was = c->lowest;
+       // KGSL's lowest level for a background context (gpu-priority=1) at a still screen, unless other work is queued, another
+       // process reads its surfaces, or its own oldest fence has waited past the bound (og_lowest_for).
+@@ -393,11 +402,15 @@ static int submit(xh_gpu3d *b, uint32_t id, const void *commands, size_t size)
+     pthread_mutex_unlock(&st.lock);
+     if (action != OG_ACTION_NONE) drm2kgsl_renderer_set_level(action == OG_ACTION_TOP);
+     if (lowest != lowest_was) drm2kgsl_renderer_set_class(ctx, cls, lowest);
++
+   }
+   // drm_context reads the stream as 32-bit words in place: the device's copy is malloc'ed, so aligned.
++  // Apply the constraint to one compositor submit only; stop renewing the clock hold immediately.
++  if (wake) drm2kgsl_renderer_set_level(1);
+   uint64_t start = now_us();
+   int r = ctx->submit_cmd(ctx, commands, size) ? -EINVAL : 0;
+   uint64_t took = now_us() - start;
++  if (wake) drm2kgsl_renderer_set_level(0);
+   pthread_mutex_lock(&st.lock);
+   st.submit_n++; st.submit_sum += took; if (took > st.submit_max) st.submit_max = took;
+   pthread_mutex_unlock(&st.lock);
+@@ -639,7 +652,9 @@ static void unref(xh_gpu3d *b, uint32_t res)
+ static void level_start(void)
+ {
+   const char *mode = getenv("ONEIOS_GPU_LEVEL");
+-  enum og_mode m = mode && !strcmp(mode, "hold") ? OG_MODE_HOLD : mode && !strcmp(mode, "governor") ? OG_MODE_GOVERNOR : OG_MODE_DEADLINE;
++  const bool touch_wake = mode && !strcmp(mode, "touch-wake");
++  enum og_mode m = mode && !strcmp(mode, "hold") ? OG_MODE_HOLD :
++                  touch_wake || (mode && !strcmp(mode, "governor")) ? OG_MODE_GOVERNOR : OG_MODE_DEADLINE;
+   unsigned long long top = 0, bottom = 0;
+   int fd = open("/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies", O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+@@ -656,6 +671,7 @@ static void level_start(void)
+   }
+   pthread_mutex_lock(&st.lock);
+   og_policy_init(&st.pol, m);
++  st.touch_wake = touch_wake;
+   if (top && bottom && top > bottom) st.pol.ratio_x16 = (uint32_t)(top * 16 / bottom);
+   st.background = getenv("ONEIOS_GPU_BACKGROUND");
+   st.front = getenv("ONEIOS_GPU_FRONT");
+@@ -664,7 +680,7 @@ static void level_start(void)
+   pthread_mutex_unlock(&st.lock);
+   drm2kgsl_renderer_set_level(0);                    // drm2kgsl's level is ours from now on (patch 0008)
+   say(1, "gpu: level: %s; KGSL's clocks %llu-%llu MHz (top/lowest x%u.%02u); priority by the owner's class %s; background by name (never on screen): %s",
+-      m == OG_MODE_HOLD ? "hold (every render-server frame at the top, to 150 ms after it: gpu-level=hold)"
++      touch_wake ? "governor with one cool compositor submit after touch-down on a still screen" : m == OG_MODE_HOLD ? "hold (every render-server frame at the top, to 150 ms after it: gpu-level=hold)"
+       : m == OG_MODE_GOVERNOR ? "the governor's alone (gpu-level=governor)"
+       : "by deadline (the top only for a frame that would miss 8.3 ms at 120 Hz, or its work interval's deadline, at the governor's clock)",
+       bottom / 1000000, top / 1000000, st.pol.ratio_x16 / 16, st.pol.ratio_x16 % 16 * 100 / 16,
+diff --git a/runtime/xnuhost/src/input.c b/runtime/xnuhost/src/input.c
+index a071b8d..372ef4b 100644
+--- a/runtime/xnuhost/src/input.c
++++ b/runtime/xnuhost/src/input.c
+@@ -22,6 +22,7 @@
+ // its next frame (xh_input_frame_shown, called from the display).
+ #define _GNU_SOURCE
+ #include "xnuhost.h"
++#include "gpu3d.h"
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <poll.h>
+@@ -131,6 +132,7 @@ static void count_frame(xh_input_source *s, int64_t scan_ns, int64_t now_ns)
+     // A touch-down on a still screen: the display's next frame is the guest's answer to it.
+     int64_t shown = __atomic_load_n(&last_shown_ns, __ATOMIC_ACQUIRE);
+     t->still = shown && scan_ns - shown >= STILL_NS;
++    if (t->still) __atomic_store_n(&xh_gpu_touch_ns, (uint64_t)now_ns, __ATOMIC_RELAXED);
+     __atomic_store_n(&down_frame_ns, -1, __ATOMIC_RELEASE);
+     __atomic_store_n(&down_ns, t->still ? scan_ns : 0, __ATOMIC_RELEASE);
+   } else {
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index abc0382..b1c8db5 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -308,7 +308,7 @@ static br_haptic *haptic;
+ static br_camera *camera;          // the camera helper process (runtime/bridges/camera, bin/oneios-camera)
+ static br_bright *brightness;     // the panel's backlight and the light sensor (runtime/bridges/brightness)
+ // A power-key press from the evdev reader: the touch IC woken (iOS turns its display on or off next).
+-static void power_key_pressed(void) { br_bright_key(brightness); }
++static void power_key_pressed(void) { br_bright_key(brightness, config.s25plus); }
+ static const br_audio_backend *session_audio;
+ static void *session_audio_ctx;
+ static void volume_key_released(bool up)
+@@ -364,12 +364,12 @@ static int vcpu_tid(unsigned vcpu) { return vcpu < g_ncpu ? g_vcpu[vcpu].tid : 0
+ // The thermal bridge's step (br_thermal_cap_for): the vCPUs and the iOS threads they run keep to fewer, slower cores
+ // while the phone is hot. Affinities of xnuhost's own threads and its tasks' only: they end with the session, nothing
+ // outside the process is written, so a SIGKILL leaves nothing to restore.
+-static unsigned cpu_thermal_step;
+ static void thermal_step(void *ctx, const br_thermal_state *state)
+ {
+   (void)ctx;
++  if (config.s25plus)
++    __atomic_store_n(&xh_cpu_thermal_step, state->cap, __ATOMIC_RELAXED);
+   if (!cpu_planned) return;
+-  __atomic_store_n(&cpu_thermal_step, state->cap, __ATOMIC_RELAXED);
+   br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, state->cap);
+   __atomic_fetch_add(&xh_cpu_place_epoch, 1, __ATOMIC_ACQ_REL);
+   for (unsigned i = 0; i < cpu_plan.nvcpu; i++) { int tid = vcpu_tid(i); if (tid > 0) place(tid, i); }
+@@ -433,9 +433,7 @@ static unsigned vcpu_uclamp(unsigned vcpu)
+     unsigned asked = br_cpu_util_for(&cpu_plan, vcpu, br_cpufreq_requested(cpu_freq, vcpu));
+     if (asked > want) want = asked;
+   }
+-  // When warm, reduce the minimum clock request. Linux may still raise the clock for real load.
+-  unsigned ceiling = config.s25plus && __atomic_load_n(&cpu_thermal_step, __ATOMIC_RELAXED) ? 640 : 1024;
+-  return want > ceiling ? ceiling : want;
++  return want > 1024 ? 1024 : want;
+ }
+ static uint64_t cpufreq_read(void *opaque, uint64_t offset, unsigned size) { return br_cpufreq_read(opaque, offset, size); }
+ static void cpufreq_write(void *opaque, uint64_t offset, unsigned size, uint64_t value) { br_cpufreq_write(opaque, offset, size, value); }
+@@ -561,8 +559,8 @@ static int boot(void)
+       metal_cdhashes = NULL;
+     } else {
+       LOGI("gpu: 24A446 Metal runtime selected on Galaxy S25+");
+-      // The phone's 120 Hz session spent long stretches at the top KGSL level.
+-      if (!*config.gpu_level) strcpy(config.gpu_level, "governor");
++      // Keep governor control between cool, touch-triggered wake pulses.
++      if (!*config.gpu_level) strcpy(config.gpu_level, "touch-wake");
+       LOGI("gpu: S25+ Metal profile: KGSL level policy %s", config.gpu_level);
+     }
+   }
+diff --git a/runtime/xnuhost/src/task.c b/runtime/xnuhost/src/task.c
+index 5784a62..2b55937 100644
+--- a/runtime/xnuhost/src/task.c
++++ b/runtime/xnuhost/src/task.c
+@@ -887,6 +887,13 @@ int64_t xh_thread_run(xh_vcpu *v, uint64_t handle, struct xh_user_state *state,
+       if (hint & XH_HINT_BACKGROUND) { lo = 0; }
+       else if (XH_HINT_FLOOR(hint) > lo) lo = XH_HINT_FLOOR(hint) > 1024 ? 1024 : XH_HINT_FLOOR(hint);
+     }
++    if (__atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED)) {
++      // Apply thermal relief after the guest's hint so it cannot reinstate a high floor.
++      // Preserve foreground headroom and trim only background demand.
++      if ((hint & (XH_HINT_VALID | XH_HINT_BACKGROUND)) == (XH_HINT_VALID | XH_HINT_BACKGROUND))
++        hi = 640;
++      if (lo > 640) lo = 640;
++    }
+     const uint32_t want = (lo | hi << 11) + 1;
+     uint32_t tid = __atomic_load_n(&tp->tid, __ATOMIC_ACQUIRE);
+     if (th->uclamp != want && tid) {
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index b260fd2..ced0bef 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -523,6 +523,7 @@ extern void (*xh_cpu_place)(int tid, unsigned vcpu);
+ // thread it releases when it differs from what that thread carries: the vCPU thread itself waits while user code runs,
+ // so a clamp on it alone never reached iOS's own code (host-overhead, 2026-11-15).
+ extern unsigned (*xh_cpu_uclamp)(unsigned vcpu);
++extern unsigned xh_cpu_thermal_step;  // S25+ session pressure, published by the thermal bridge
+ // drm2kgsl's vCPU clamp while a constrained queue animates (its patch 0008 calls drm2kgsl_vcpu_uclamp, cpu.c): 0 = none.
+ extern unsigned xh_gpu_vcpu_boost;
+ 
+diff --git a/runtime/xnuhost/tests/test_gpu_policy.c b/runtime/xnuhost/tests/test_gpu_policy.c
+index 6e66adf..e001e3b 100644
+--- a/runtime/xnuhost/tests/test_gpu_policy.c
++++ b/runtime/xnuhost/tests/test_gpu_policy.c
+@@ -452,6 +452,11 @@ static void starvation(void)
+ 
+ int main(void)
+ {
++  CHECK(og_touch_wake_due(1000 * MS, 1020 * MS, 0, false));
++  CHECK(!og_touch_wake_due(1000 * MS, 1020 * MS, 0, true));
++  CHECK(!og_touch_wake_due(1000 * MS, 1121 * MS, 0, false));
++  CHECK(!og_touch_wake_due(1000 * MS, 1021 * MS, 1020 * MS, false));
++  CHECK(!og_touch_wake_due(1100 * MS, 1120 * MS, 1020 * MS, false));
+   classes();
+   pages();
+   levels();
