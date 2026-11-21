@@ -1,0 +1,184 @@
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 7a80b69..08b7174 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -372,7 +372,11 @@ static void thermal_step(void *ctx, const br_thermal_state *state)
+   if (!cpu_planned) return;
+   uint64_t before[XH_MAX_CPUS];
+   for (unsigned i = 0; i < cpu_plan.nvcpu; i++) before[i] = place_mask(i);
+-  unsigned affinity_step = state->cap == BR_THERMAL_CAP_HOT ? BR_THERMAL_CAP_WARM : state->cap;
++  // Keep the S25+'s two P vCPUs on their own cluster. The critical affinity
++  // fallback there widened them to all eight cores during the reported stall.
++  const bool keep_cluster = state->cap == BR_THERMAL_CAP_HOT ||
++                            (config.s25plus && state->cap == BR_THERMAL_CAP_CRITICAL);
++  unsigned affinity_step = keep_cluster ? BR_THERMAL_CAP_WARM : state->cap;
+   br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, affinity_step);
+   bool changed = false;
+   for (unsigned i = 0; i < cpu_plan.nvcpu; i++) {
+diff --git a/runtime/xnuhost/src/task.c b/runtime/xnuhost/src/task.c
+index b6e5dcb..fabab1b 100644
+--- a/runtime/xnuhost/src/task.c
++++ b/runtime/xnuhost/src/task.c
+@@ -898,6 +898,7 @@ int64_t xh_thread_run(xh_vcpu *v, uint64_t handle, struct xh_user_state *state,
+       if (background) hi = background_limit;
+       // Leave more headroom for UI and audio at the first warm stage.
+       const bool latency_sensitive = (hint & XH_HINT_VALID) && (hint & (XH_HINT_UI | XH_HINT_REALTIME));
++      if (!background && step == BR_THERMAL_CAP_CRITICAL) hi = latency_sensitive ? 896 : 768;
+       const unsigned floor_limit = step == BR_THERMAL_CAP_WARM && latency_sensitive ? 768 :
+                                    step == BR_THERMAL_CAP_CRITICAL ? 512 : 640;
+       lo = (lo < floor_limit ? lo : floor_limit) & ~63u;
+diff --git a/runtime/xnuhost/src/virtio_input.c b/runtime/xnuhost/src/virtio_input.c
+index ad81833..573ade7 100644
+--- a/runtime/xnuhost/src/virtio_input.c
++++ b/runtime/xnuhost/src/virtio_input.c
+@@ -8,7 +8,9 @@
+ #include <string.h>
+ 
+ enum { CFG_ID_NAME = 1, CFG_ID_SERIAL = 2, CFG_ID_DEVIDS = 3, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
+-enum { EV_SYN_ = 0, EV_KEY_ = 1, EV_ABS_ = 3 };
++enum { EV_SYN_ = 0, EV_KEY_ = 1, EV_ABS_ = 3, EV_MSC_ = 4, SYN_REPORT_ = 0, MSC_TIMESTAMP_ = 5,
++       ABS_MT_SLOT_ = 0x2f, ABS_MT_TOUCH_MAJOR_ = 0x30, ABS_MT_POSITION_X_ = 0x35,
++       ABS_MT_POSITION_Y_ = 0x36, ABS_MT_PRESSURE_ = 0x3a };
+ #define ABS_COUNT_ 0x40
+ #define BACKLOG 1024
+ 
+@@ -18,6 +20,7 @@ typedef struct {
+   struct { int32_t min, max, fuzz, flat, res; bool present; } abs[ABS_COUNT_];
+   input_event backlog[BACKLOG];              // events the guest had no buffer for
+   unsigned head, count;
++  bool partial;                             // the oldest report has already started reaching the guest
+   char name[32], serial[32];                 // the configuration's ID_NAME and ID_SERIAL
+   uint16_t keys[8];                          // its EV_KEY bits
+   unsigned nkeys;
+@@ -74,6 +77,56 @@ static void input_config_write(xh_virtio *dev, uint32_t offset, unsigned size, u
+   else if (offset == 1) s->subsel = (uint8_t)value;
+ }
+ 
++static input_event *queued(input_state *s, unsigned offset)
++{
++  return &s->backlog[(s->head + offset) % BACKLOG];
++}
++
++static bool report_end(const input_event *event)
++{
++  return event->type == EV_SYN_ && event->code == SYN_REPORT_;
++}
++
++static unsigned report_start(input_state *s, unsigned end)
++{
++  unsigned first = end;
++  while (first && end - first < 32 && !report_end(queued(s, first - 1))) first--;
++  return first;
++}
++
++// Keep the newest of two fully queued motion reports only when they update the
++// same fields on the same slots. Key and contact lifecycles stay in FIFO order.
++static void merge_motion(input_state *s)
++{
++  unsigned end = s->count - 1, newer = report_start(s, end);
++  if (!newer || !report_end(queued(s, newer - 1))) return;
++  unsigned older = report_start(s, newer - 1);
++  if ((!older && s->partial) || (older && !report_end(queued(s, older - 1))) ||
++      newer - older != s->count - newer) return;
++
++  bool explicit_slot = false, motion = false;
++  for (unsigned i = 0; i < end - newer; i++) {
++    const input_event *a = queued(s, older + i), *b = queued(s, newer + i);
++    if (a->type != b->type || a->code != b->code) return;
++    if (b->type == EV_MSC_ && b->code == MSC_TIMESTAMP_) continue;
++    if (b->type != EV_ABS_) return;
++    switch (b->code) {
++    case ABS_MT_SLOT_:
++      if (a->value != b->value || (!explicit_slot && motion)) return;
++      explicit_slot = true;
++      break;
++    case ABS_MT_POSITION_X_: case ABS_MT_POSITION_Y_: case ABS_MT_PRESSURE_: case ABS_MT_TOUCH_MAJOR_:
++      motion = true;
++      break;
++    default:
++      return;
++    }
++  }
++  if (!motion) return;
++  for (unsigned i = 0; i <= end - newer; i++) *queued(s, older + i) = *queued(s, newer + i);
++  s->count = newer;
++}
++
+ // Moves backlog events into buffers the guest has posted on the event queue.
+ static void drain(xh_virtio *dev, input_state *s)
+ {
+@@ -83,7 +136,8 @@ static void drain(xh_virtio *dev, input_state *s)
+     unsigned n = xh_virtio_pop(dev, 0, &head, iov, 4);
+     if (!n) return;
+     if (iov[0].writable && iov[0].length >= 8) {
+-      memcpy(iov[0].data, &s->backlog[s->head], 8);
++      s->partial = !report_end(queued(s, 0));
++      memcpy(iov[0].data, queued(s, 0), sizeof(input_event));
+       s->head = (s->head + 1) % BACKLOG;
+       s->count--;
+       xh_virtio_push(dev, 0, head, 8);
+@@ -138,10 +192,17 @@ void xh_virtio_input_event(xh_virtio *dev, uint16_t type, uint16_t code, int32_t
+ {
+   input_state *s = xh_virtio_opaque(dev);
+   xh_virtio_lock(dev);
+-  if (s->count == BACKLOG) { s->head = (s->head + 1) % BACKLOG; s->count--; }      // oldest lost
++  if (s->count == BACKLOG) {
++    s->partial = !report_end(queued(s, 0));
++    s->head = (s->head + 1) % BACKLOG;
++    s->count--;
++  }
+   s->backlog[(s->head + s->count++) % BACKLOG] = (input_event){ type, code, value };
+   // Events are handed over at a report boundary, so the guest never sees half a touch frame.
+-  if (type == EV_SYN_) drain(dev, s);
++  if (type == EV_SYN_) {
++    if (code == SYN_REPORT_ && s->count > 1) merge_motion(s);
++    drain(dev, s);
++  }
+   xh_virtio_unlock(dev);
+ }
+ 
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index ec8f770..98079be 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1204,6 +1204,32 @@ static unsigned input_take(driver *d, test_ev *out, unsigned max)
+   return n;
+ }
+ 
++static void test_input_coalescing(void)
++{
++  driver d = { .dev = xh_virtio_input_create(0, 43) };
++  CHECK(d.dev && driver_init(&d, 0, 2, GUEST_PA + 0x10000));
++  xh_virtio_input_event(d.dev, 3, 0x39, 5);   // contact down
++  xh_virtio_input_event(d.dev, 0, 0, 0);
++  for (int x = 10; x <= 40; x += 10) {
++    xh_virtio_input_event(d.dev, 3, 0x35, x);
++    xh_virtio_input_event(d.dev, 3, 0x36, x + 1);
++    xh_virtio_input_event(d.dev, 4, 5, x * 100);
++    xh_virtio_input_event(d.dev, 0, 0, 0);
++  }
++  xh_virtio_input_event(d.dev, 3, 0x39, -1);   // contact up
++  xh_virtio_input_event(d.dev, 0, 0, 0);
++  CHECK(xh_virtio_input_backlog(d.dev) == 8);
++  for (unsigned i = 0; i < 8; i++)
++    driver_send(&d, 0, (const uint64_t[][3]){ { GUEST_PA + 0x50000 + i * 8, 8, 1 } }, 1, false);
++  W(&d, 0x50, 0);
++  test_ev events[12];
++  CHECK(input_take(&d, events, 12) == 8);
++  CHECK(events[0].code == 0x39 && events[0].value == 5 && events[1].type == 0);
++  CHECK(events[2].code == 0x35 && events[2].value == 40 && events[3].code == 0x36 && events[3].value == 41);
++  CHECK(events[4].type == 4 && events[4].value == 4000 && events[5].type == 0);
++  CHECK(events[6].code == 0x39 && events[6].value == -1 && events[7].type == 0);
++}
++
+ static xh_input_state fake_state;
+ static int fake_read_state(xh_input_source *s, xh_input_state *state) { (void)s; *state = fake_state; return 0; }
+ 
+@@ -2644,6 +2670,7 @@ int main(void)
+   test_virtio_gpu();
+   test_virtio_gpu3d();
+   test_virtio_input();
++  test_input_coalescing();
+   test_input_filter();
+   test_pen();
+   test_input_script();
