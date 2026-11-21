@@ -12,7 +12,7 @@ on:
         default: "44822977313"
         type: string
   push:
-    branches: [build/runtime-0.1.35]
+    branches: [build/runtime-0.1.36]
     paths:
       - .github/workflows/package-metal.yml
 permissions:
@@ -51,6 +51,8 @@ jobs:
           git apply ../port/patches/s25plus-lower-render-resolution-0.1.34.patch
           git apply --check ../port/patches/s25-series-render-resolution-0.1.35.patch
           git apply ../port/patches/s25-series-render-resolution-0.1.35.patch
+          git apply --check ../port/patches/s25plus-thermal-governor-ram-0.1.36.patch
+          git apply ../port/patches/s25plus-thermal-governor-ram-0.1.36.patch
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -105,13 +107,13 @@ jobs:
         env:
           ONEIOS_BUILD_AEA: '1'
           PACKAGE_EXTRA_DIR: ${{ github.workspace }}/metal-stage
-        run: bash runtime/package.sh 0.1.35-s25plusmetal
+        run: bash runtime/package.sh 0.1.36-s25plusmetal
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Metal-Runtime-0.1.35
+          name: OneiOS-S25Plus-Metal-Runtime-0.1.36
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.35-s25plusmetal-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.35-s25plusmetal-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.36-s25plusmetal-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.36-s25plusmetal-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30

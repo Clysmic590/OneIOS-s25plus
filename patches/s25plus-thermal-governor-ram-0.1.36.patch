@@ -1,0 +1,234 @@
+diff --git a/runtime/bridges/thermal/test_thermal.c b/runtime/bridges/thermal/test_thermal.c
+index 42b9ae4..7f9cd14 100644
+--- a/runtime/bridges/thermal/test_thermal.c
++++ b/runtime/bridges/thermal/test_thermal.c
+@@ -297,6 +297,27 @@ static void test_worker(void)
+   br_thermal_close(t);
+ }
+ 
++static void test_early_cap(void)
++{
++  put("/sys/class/power_supply/battery/lrp", "425\n");
++  const br_thermal_options options = { .root = base, .poll_ms = 20, .early_cpu_cap = true };
++  br_thermal *t = br_thermal_open(&options);
++  CHECK(t != NULL);
++  if (!t) return;
++  br_thermal_state state;
++  br_thermal_get(t, &state);
++  CHECK(state.skin_level == BR_THERMAL_MODERATE && state.cap == 1);
++  put("/sys/class/power_supply/battery/lrp", "415\n");
++  wait_ms(150);
++  br_thermal_get(t, &state);
++  CHECK(state.cap == 1);
++  put("/sys/class/power_supply/battery/lrp", "390\n");
++  wait_ms(150);
++  br_thermal_get(t, &state);
++  CHECK(state.cap == 0);
++  br_thermal_close(t);
++}
++
+ // The load line from fake /proc and battery files: two samples 30 s apart on an 8-CPU host.
+ static char last_line[512];
+ static void keep_line(int level, const char *line) { (void)level; if (!strncmp(line, "thermal: ", 9) && strstr(line, "host CPU")) snprintf(last_line, sizeof last_line, "%s", line); }
+@@ -414,6 +435,7 @@ int main(void)
+   test_masks();
+   test_sysfs();
+   test_worker();
++  test_early_cap();
+   test_load();
+   test_hal();
+   char cmd[300];
+diff --git a/runtime/bridges/thermal/thermal.c b/runtime/bridges/thermal/thermal.c
+index 78b5e37..2845105 100644
+--- a/runtime/bridges/thermal/thermal.c
++++ b/runtime/bridges/thermal/thermal.c
+@@ -455,7 +455,7 @@ static unsigned session_cap(const br_thermal *t, const br_thermal_state *s)
+ {
+   if (t->cap_off) return 0;
+   if (s->cap) return s->cap;
+-  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_HEAVY ||
++  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_MODERATE ||
+                              s->battery_level >= BR_THERMAL_HEAVY || s->soc_level >= BR_THERMAL_TRAPPING) ? 1 : 0;
+ }
+ 
+diff --git a/runtime/xnuhost/drm2kgsl/disable-fence-export.patch b/runtime/xnuhost/drm2kgsl/disable-fence-export.patch
+index 5d630b5..ce53aa3 100644
+--- a/runtime/xnuhost/drm2kgsl/disable-fence-export.patch
++++ b/runtime/xnuhost/drm2kgsl/disable-fence-export.patch
+@@ -1,13 +1,40 @@
+ --- a/src/drm/drm_fence.c
+ +++ b/src/drm/drm_fence.c
+-@@ -191,7 +191,9 @@
++@@ -4,12 +4,12 @@
++  */
++ 
++ #include <errno.h>
+++#include <fcntl.h>
++ #include <inttypes.h>
++ #include <poll.h>
++ #include <string.h>
++ 
++ #include "virgl_context.h"
++-#include "virgl_fence.h"
++ #include "virgl_util.h"
++ 
++ #include "util/os_file.h"
++@@ -70,7 +70,9 @@ drm_fence_create(int fd, uint32_t flags, uint64_t fence_id)
++    if (!fence)
++       return NULL;
++ 
++-   fence->fd = os_dupfd_cloexec(fd);
+++   // The timeline already owns fd. Reuse a close-on-exec descriptor when possible.
+++   int flags_fd = fcntl(fd, F_GETFD);
+++   fence->fd = flags_fd >= 0 && (flags_fd & FD_CLOEXEC) ? fd : os_dupfd_cloexec(fd);
++ 
++    if (fence->fd < 0) {
++       free(fence);
++@@ -191,9 +193,9 @@ drm_timeline_submit_fence(struct drm_timeline *timeline, uint32_t flags,
+           return -ENOMEM;
+  
+        drm_dbg("fence: %p (%" PRIu64 ")", (void*)fence, fence->fence_id);
+ -      virgl_fence_set_fd(fence_id, fence->fd);
+-+      /* xnuhost completes fences through this timeline's retire callback.
+-+       * The export table is unused here and its global IDs collide when
+-+       * different guest contexts submit their own fence sequences. */
+- 
+-       close(timeline->last_fence_fd);
++-
++-      close(timeline->last_fence_fd);
+++      /* xnuhost retires fences on their own timeline through the callback. */
+++      if (fence->fd != timeline->last_fence_fd)
+++         close(timeline->last_fence_fd);
+        timeline->last_fence_fd = -1;
++    } else if (timeline->last_ts_valid) {
++       fence = drm_fence_create_timestamp(timeline->last_ctx_id,
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index ed8ac72..764209f 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -400,9 +400,9 @@ int xh_config_finish(xh_config *c)
+   // The guest's RAM: the command line's ram=, else the image set's, else auto.
+   if (!c->ram_given && from_image.ram_given) c->ram_bytes = from_image.ram_bytes;
+   if (c->ram_percent < 0) c->ram_percent = from_image.ram_percent < 0 ? XH_RAM_AUTO_PERCENT : from_image.ram_percent;
+-  // OneOS's S25+ profile starts at 45%. On this phone, 50% rounds to 5376 MiB,
+-  // one 256 MiB step above the previous 5120 MiB. The host-fit limits still apply.
+-  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 50;
++  // This phone's OneOS automatic profile starts at 45%. The fit rounds 52% to
++  // 5632 MiB, one step above the previous 5376 MiB, when the host has room.
++  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 52;
+   if (c->ram_host_floor < 0) c->ram_host_floor = from_image.ram_host_floor < 0 ? (int64_t)XH_RAM_AUTO_FLOOR : from_image.ram_host_floor;
+   if (c->host_mem_log < 0) c->host_mem_log = from_image.host_mem_log < 0 ? 30 : from_image.host_mem_log;
+   if (c->usb_log < 0) c->usb_log = from_image.usb_log < 0 ? 3 : from_image.usb_log;
+diff --git a/runtime/xnuhost/src/gpu3d_kgsl.c b/runtime/xnuhost/src/gpu3d_kgsl.c
+index 9b6fc03..f4bc758 100644
+--- a/runtime/xnuhost/src/gpu3d_kgsl.c
++++ b/runtime/xnuhost/src/gpu3d_kgsl.c
+@@ -139,7 +139,7 @@ static struct {
+   struct og_policy pol;
+   const char *background, *front;           // the name lists (NULL: the policy's defaults)
+   uint64_t lowest_n, said_frames, said_top, said_ups, said_downs, said_misses, said_late, said_lowest, said_refused, said_undone;
+-  bool touch_wake;
++  bool touch_wake, cooling;
+   uint64_t last_touch_wake_ns;
+   bool priority_on;                         // gpu-priority=1: background queues can carry KGSL's lowest level (patch 0008)
+   uint32_t fg_pending;                      // fences of non-background contexts not yet retired (og_lowest_for)
+@@ -381,21 +381,33 @@ static int submit(xh_gpu3d *b, uint32_t id, const void *commands, size_t size)
+     bool lowest = false, lowest_was = false;
+     if (c) {
+       uint64_t now = now_us() * 1000u;
+-      action = og_frame_start(&st.pol, c->cls, now, (uint32_t)c->hint[2] * OG_HINT_DEADLINE_US, &c->next);
+-      c->has_next = c->next.budget_us != 0;
+-      if (st.touch_wake && c->cls == OG_CLASS_RENDER) {
+-        const uint64_t touch = __atomic_load_n(&xh_gpu_touch_ns, __ATOMIC_RELAXED);
+-        const bool warm = __atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED) != 0;
+-        wake = og_touch_wake_due(touch, now, st.last_touch_wake_ns, warm);
+-        if (wake) st.last_touch_wake_ns = now;
++      const bool warm = __atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED) != 0;
++      if (warm) {
++        c->next = (struct og_frame){0};
++        if (!st.cooling) {
++          st.pol.level = st.pol.told = OG_LEVEL_GOVERNOR;
++          st.pol.last_bg_min_ns = 0;
++          action = OG_ACTION_GOVERNOR;
++          st.cooling = true;
++          say(1, "gpu: warm session, KGSL governor controls clocks without guest boosts");
++        }
++      } else {
++        st.cooling = false;
++        action = og_frame_start(&st.pol, c->cls, now, (uint32_t)c->hint[2] * OG_HINT_DEADLINE_US, &c->next);
++        if (st.touch_wake && c->cls == OG_CLASS_RENDER) {
++          const uint64_t touch = __atomic_load_n(&xh_gpu_touch_ns, __ATOMIC_RELAXED);
++          wake = og_touch_wake_due(touch, now, st.last_touch_wake_ns, warm);
++          if (wake) st.last_touch_wake_ns = now;
++        }
+       }
++      c->has_next = c->next.budget_us != 0;
+       lowest_was = c->lowest;
+       // KGSL's lowest level for a background context (gpu-priority=1) at a still screen, unless other work is queued, another
+       // process reads its surfaces, or its own oldest fence has waited past the bound (og_lowest_for).
+       uint64_t oldest = 0;
+       for (unsigned r = 0; r < STAT_RINGS; r++)
+         if (c->count[r] && (!oldest || c->pending[r][c->head[r]].at < oldest)) oldest = c->pending[r][c->head[r]].at;
+-      lowest = c->lowest = c->cls == OG_CLASS_BACKGROUND && st.priority_on && og_lowest_for(&st.pol, now, st.fg_pending, c->shared, oldest * 1000u);
++      lowest = c->lowest = !warm && c->cls == OG_CLASS_BACKGROUND && st.priority_on && og_lowest_for(&st.pol, now, st.fg_pending, c->shared, oldest * 1000u);
+       if (lowest) st.lowest_n++;
+     }
+     enum og_class cls = c ? c->cls : OG_CLASS_DEFAULT;
+diff --git a/runtime/xnuhost/src/task.c b/runtime/xnuhost/src/task.c
+index 11bc4b4..f79c265 100644
+--- a/runtime/xnuhost/src/task.c
++++ b/runtime/xnuhost/src/task.c
+@@ -887,12 +887,15 @@ int64_t xh_thread_run(xh_vcpu *v, uint64_t handle, struct xh_user_state *state,
+       if (hint & XH_HINT_BACKGROUND) { lo = 0; }
+       else if (XH_HINT_FLOOR(hint) > lo) lo = XH_HINT_FLOOR(hint) > 1024 ? 1024 : XH_HINT_FLOOR(hint);
+     }
+-    if (__atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED)) {
++    const unsigned step = __atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED);
++    if (step) {
+       // Apply thermal relief after the guest's hint so it cannot reinstate a high floor.
+       // Preserve foreground headroom and trim only background demand.
++      const unsigned limit = step > 1 ? 512 : 640;
+       if ((hint & (XH_HINT_VALID | XH_HINT_BACKGROUND)) == (XH_HINT_VALID | XH_HINT_BACKGROUND))
+-        hi = 640;
+-      if (lo > 640) lo = 640;
++        hi = limit;
++      // Requests within one step share a floor, avoiding repeated scheduler writes while warm.
++      lo = (lo < limit ? lo : limit) & ~63u;
+     }
+     const uint32_t want = (lo | hi << 11) + 1;
+     uint32_t tid = __atomic_load_n(&tp->tid, __ATOMIC_ACQUIRE);
+diff --git a/runtime/xnuhost/tests/test_drm2kgsl.c b/runtime/xnuhost/tests/test_drm2kgsl.c
+index 6545154..6c418d0 100644
+--- a/runtime/xnuhost/tests/test_drm2kgsl.c
++++ b/runtime/xnuhost/tests/test_drm2kgsl.c
+@@ -276,7 +276,7 @@ static int separate_fence_timelines(void)
+   int first_fd = eventfd(0, EFD_CLOEXEC), second_fd = eventfd(0, EFD_CLOEXEC);
+   CHECK(first_fd >= 0 && second_fd >= 0);
+   if (first_fd < 0 || second_fd < 0) return 1;
+-  int first_wait = dup(first_fd), second_wait = dup(second_fd);
++  int first_wait = fcntl(first_fd, F_DUPFD_CLOEXEC, 0), second_wait = dup(second_fd);
+   CHECK(first_wait >= 0 && second_wait >= 0);
+   if (first_wait < 0 || second_wait < 0) return 1;
+   drm_timeline_init(&a, &first, "test-fence-a", 1, fence_completed);
+@@ -285,6 +285,8 @@ static int separate_fence_timelines(void)
+   drm_timeline_set_last_fence_fd(&b, second_wait);
+   CHECK(drm_timeline_submit_fence(&a, 0, 1) == 0);
+   CHECK(drm_timeline_submit_fence(&b, 0, 1) == 0);
++  CHECK(fcntl(first_wait, F_GETFD) == FD_CLOEXEC);
++  CHECK(fcntl(second_wait, F_GETFD) == -1 && errno == EBADF);
+   CHECK(!strstr(last_error, "virgl_fence_set_fd"));
+   CHECK(eventfd_write(second_fd, 1) == 0);
+   for (int i = 0; i < 200 && !atomic_load(&completed_fences); i++) usleep(1000);
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index ba8c5ee..8cbab5b 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1785,6 +1785,8 @@ static void test_config(const char *dir)
+   // 552 - 256 = 841 MiB of MemAvailable, the valve's 256 MiB and 585 MiB more for what else grows (that session's growth
+   // outside the guest besides page tables and zram was about 300-350 MiB [estimate from its meminfo]).
+   CHECK(8561 * M - 6912 * M - 6912 * M * PT / 100 - GR > XH_RAM_UNLOCK_BELOW + 512 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 52, XH_RAM_AUTO_FLOOR, 7322 * M, NULL) == 5632 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 52, XH_RAM_AUTO_FLOOR, 5380 * M, NULL) == 5376 * M);
+   char set_meminfo[340], set_small[340], set_none[340];
+   snprintf(set_meminfo, sizeof set_meminfo, "ram-meminfo=%s", meminfo);
+   snprintf(set_small, sizeof set_small, "ram-meminfo=%s", small);
