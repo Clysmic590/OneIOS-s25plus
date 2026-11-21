@@ -1,0 +1,39 @@
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index e27f4e0..ed8ac72 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -334,6 +334,7 @@ int xh_config_finish(xh_config *c)
+     bool plus = !strcmp(device, "pa2q") && !strncmp(model, "SM-S936", 7);
+     bool s25 = plus || (!strcmp(device, "pa1q") && !strncmp(model, "SM-S931", 7)) ||
+                        (!strcmp(device, "pa3q") && !strncmp(model, "SM-S938", 7));
++    if (s25 && !c->display_render_scale) c->display_render_scale = 2;
+     size_t used = strlen(c->boot_args);
+     if (s25 && !has_switch(c->boot_args, "oneios-hid-buttons-builtin") && sizeof buttons <= sizeof c->boot_args - used) {
+       memcpy(c->boot_args + used, buttons, sizeof buttons);
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 130f2f8..b1c8db5 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -559,7 +559,6 @@ static int boot(void)
+       metal_cdhashes = NULL;
+     } else {
+       LOGI("gpu: 24A446 Metal runtime selected on Galaxy S25+");
+-      if (!config.display_render_scale) config.display_render_scale = 2;
+       // Keep governor control between cool, touch-triggered wake pulses.
+       if (!*config.gpu_level) strcpy(config.gpu_level, "touch-wake");
+       LOGI("gpu: S25+ Metal profile: KGSL level policy %s", config.gpu_level);
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 54c2bb7..ba8c5ee 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1993,6 +1993,10 @@ static void test_config(const char *dir)
+     const xh_panel_mode panel = { 1080, 2340, 120 };
+     xh_panel_mode compact = xh_display_render_mode(&reduced, &panel);
+     CHECK(compact.width == 720 && compact.height == 1560 && compact.hz == 120 && reduced.scale == 2);
++    const xh_panel_mode qhd_panel = { 1440, 3120, 120 };
++    reduced.scale = 3;
++    compact = xh_display_render_mode(&reduced, &qhd_panel);
++    CHECK(compact.width == 960 && compact.height == 2080 && compact.hz == 120 && reduced.scale == 2);
+     reduced.scale = 3;
+     strcpy(reduced.boot_args, "offline-legacy-unit-scale=3");
+     compact = xh_display_render_mode(&reduced, &panel);
