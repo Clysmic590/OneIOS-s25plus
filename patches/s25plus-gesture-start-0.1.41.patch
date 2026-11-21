@@ -1,0 +1,118 @@
+diff --git a/runtime/xnuhost/src/virtio_input.c b/runtime/xnuhost/src/virtio_input.c
+index af887ae..aea7916 100644
+--- a/runtime/xnuhost/src/virtio_input.c
++++ b/runtime/xnuhost/src/virtio_input.c
+@@ -10,7 +10,7 @@
+ enum { CFG_ID_NAME = 1, CFG_ID_SERIAL = 2, CFG_ID_DEVIDS = 3, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
+ enum { EV_SYN_ = 0, EV_KEY_ = 1, EV_ABS_ = 3, EV_MSC_ = 4, SYN_REPORT_ = 0, MSC_TIMESTAMP_ = 5,
+        ABS_MT_SLOT_ = 0x2f, ABS_MT_TOUCH_MAJOR_ = 0x30, ABS_MT_POSITION_X_ = 0x35,
+-       ABS_MT_POSITION_Y_ = 0x36, ABS_MT_PRESSURE_ = 0x3a };
++       ABS_MT_POSITION_Y_ = 0x36, ABS_MT_TRACKING_ID_ = 0x39, ABS_MT_PRESSURE_ = 0x3a };
+ #define ABS_COUNT_ 0x40
+ #define BACKLOG 1024
+ 
+@@ -24,6 +24,8 @@ typedef struct {
+   char name[32], serial[32];                 // the configuration's ID_NAME and ID_SERIAL
+   uint16_t keys[8];                          // its EV_KEY bits
+   unsigned nkeys;
++  unsigned first_motion_end;                 // number of queued events through the first motion report
++  bool contact_began, report_has_position, preserve_next_motion;
+ } input_state;
+ 
+ // The touch screen's (the default): the side keys and BTN_TOUCH. The pen's device (pen.c) states its own.
+@@ -101,7 +103,8 @@ static void merge_motion(input_state *s)
+   unsigned end = s->count - 1, newer = report_start(s, end);
+   if (!newer || !report_end(queued(s, newer - 1))) return;
+   unsigned older = report_start(s, newer - 1);
+-  if ((!older && s->partial) || (older && !report_end(queued(s, older - 1))) ||
++  if (newer == s->first_motion_end ||
++      (!older && s->partial) || (older && !report_end(queued(s, older - 1))) ||
+       newer - older != s->count - newer) return;
+ 
+   bool explicit_slot = false, motion = false;
+@@ -127,6 +130,14 @@ static void merge_motion(input_state *s)
+   s->count = newer;
+ }
+ 
++static void consume_event(input_state *s)
++{
++  s->partial = !report_end(queued(s, 0));
++  s->head = (s->head + 1) % BACKLOG;
++  s->count--;
++  if (s->first_motion_end) s->first_motion_end--;
++}
++
+ // Moves backlog events into buffers the guest has posted on the event queue.
+ static void drain(xh_virtio *dev, input_state *s)
+ {
+@@ -136,10 +147,8 @@ static void drain(xh_virtio *dev, input_state *s)
+     unsigned n = xh_virtio_pop(dev, 0, &head, iov, 4);
+     if (!n) return;
+     if (iov[0].writable && iov[0].length >= 8) {
+-      s->partial = !report_end(queued(s, 0));
+       memcpy(iov[0].data, queued(s, 0), sizeof(input_event));
+-      s->head = (s->head + 1) % BACKLOG;
+-      s->count--;
++      consume_event(s);
+       xh_virtio_push(dev, 0, head, 8);
+     } else xh_virtio_push(dev, 0, head, 0);
+   }
+@@ -192,15 +201,25 @@ void xh_virtio_input_event(xh_virtio *dev, uint16_t type, uint16_t code, int32_t
+ {
+   input_state *s = xh_virtio_opaque(dev);
+   xh_virtio_lock(dev);
+-  if (s->count == BACKLOG) {
+-    s->partial = !report_end(queued(s, 0));
+-    s->head = (s->head + 1) % BACKLOG;
+-    s->count--;
++  if (s->count == BACKLOG) consume_event(s);
++  if (type == EV_ABS_) {
++    if (code == ABS_MT_TRACKING_ID_ && value >= 0) s->contact_began = true;
++    if (code == ABS_MT_POSITION_X_ || code == ABS_MT_POSITION_Y_) s->report_has_position = true;
+   }
+   s->backlog[(s->head + s->count++) % BACKLOG] = (input_event){ type, code, value };
+   // Events are handed over at a report boundary, so the guest never sees half a touch frame.
+   if (type == EV_SYN_) {
+-    if (code == SYN_REPORT_ && s->count > 1) merge_motion(s);
++    if (code == SYN_REPORT_) {
++      // An edge gesture needs an initial movement sample even if the guest is
++      // temporarily behind. Keep that sample as well as the latest position.
++      if (s->contact_began) s->preserve_next_motion = true;
++      else if (s->preserve_next_motion && s->report_has_position) {
++        s->first_motion_end = s->count;
++        s->preserve_next_motion = false;
++      } else if (s->count > 1) merge_motion(s);
++      s->contact_began = false;
++      s->report_has_position = false;
++    }
+     drain(dev, s);
+   }
+   xh_virtio_unlock(dev);
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index aa7932a..f5aa9e6 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1218,16 +1218,18 @@ static void test_input_coalescing(void)
+   }
+   xh_virtio_input_event(d.dev, 3, 0x39, -1);   // contact up
+   xh_virtio_input_event(d.dev, 0, 0, 0);
+-  CHECK(xh_virtio_input_backlog(d.dev) == 8);
++  CHECK(xh_virtio_input_backlog(d.dev) == 12);
+   for (unsigned i = 0; i < 8; i++)
+     driver_send(&d, 0, (const uint64_t[][3]){ { GUEST_PA + 0x50000 + i * 8, 8, 1 } }, 1, false);
+   W(&d, 0x50, 0);
+   test_ev events[12];
+-  CHECK(input_take(&d, events, 12) == 8);
++  CHECK(input_take(&d, events, 12) == 12);
+   CHECK(events[0].code == 0x39 && events[0].value == 5 && events[1].type == 0);
+-  CHECK(events[2].code == 0x35 && events[2].value == 40 && events[3].code == 0x36 && events[3].value == 41);
+-  CHECK(events[4].type == 4 && events[4].value == 4000 && events[5].type == 0);
+-  CHECK(events[6].code == 0x39 && events[6].value == -1 && events[7].type == 0);
++  CHECK(events[2].code == 0x35 && events[2].value == 10 && events[3].code == 0x36 && events[3].value == 11);
++  CHECK(events[4].type == 4 && events[4].value == 1000 && events[5].type == 0);
++  CHECK(events[6].code == 0x35 && events[6].value == 40 && events[7].code == 0x36 && events[7].value == 41);
++  CHECK(events[8].type == 4 && events[8].value == 4000 && events[9].type == 0);
++  CHECK(events[10].code == 0x39 && events[10].value == -1 && events[11].type == 0);
+ }
+ 
+ static xh_input_state fake_state;
