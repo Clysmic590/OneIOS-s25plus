@@ -1,0 +1,140 @@
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 79bc56a..e27f4e0 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -156,6 +156,7 @@ int xh_config_set(xh_config *c, const char *key, const char *value)
+   else if (!strcmp(key, "input-script")) return copy(c->input_script, sizeof c->input_script, value);
+   else if (!strcmp(key, "tasks")) return flag(value, &c->tasks);
+   else if (!strcmp(key, "task-uid")) c->task_uid = atoi(value);
++  else if (!strcmp(key, "display-render-scale")) { ok = number(value, 2, 3, &c->display_render_scale); }
+   else if (!strcmp(key, "display-direct")) { bool on; if (flag(value, &on)) return -1; c->display_direct = on; }
+   else if (!strcmp(key, "touch-sleep")) return flag(value, &c->touch_sleep);
+   else if (!strcmp(key, "pen")) { ok = !strcmp(value, "auto") || !strcmp(value, "off"); if (ok) strcpy(c->pen, value); }
+@@ -309,6 +310,7 @@ int xh_config_finish(xh_config *c)
+   if (!c->hz) c->hz = from_image.hz;
+   if (!c->display_format) c->display_format = from_image.display_format ? from_image.display_format : XH_PIXELS_BGRX8;
+   if (c->display_direct < 0) c->display_direct = from_image.display_direct;
++  if (!c->display_render_scale) c->display_render_scale = from_image.display_render_scale;
+   // The KMS back end scans out 32-bit pixels: half floats only go to a display helper (shm) or nowhere.
+   if (c->display_format == XH_PIXELS_RGBA16F && !strcmp(c->display, "drm")) { fprintf(stderr, "xnuhost: display-format=rgba16f needs --display shm\n"); return -1; }
+   if (!c->scale) c->scale = from_image.scale ? from_image.scale : 3;
+@@ -622,6 +624,22 @@ static bool has_switch(const char *args, const char *name)
+   return false;
+ }
+ 
++xh_panel_mode xh_display_render_mode(xh_config *c, const xh_panel_mode *panel)
++{
++  xh_panel_mode mode = xh_display_mode(c, panel);
++  // Keep the point size and refresh, and let SurfaceFlinger upscale the smaller backing.
++  // Leave explicit dimensions, boot scales, and configurations without a real panel alone.
++  if (c->display_render_scale == 2 && c->scale == 3 && panel && !c->width && !c->height &&
++      !strcmp(c->mode, "takeover") && !strcmp(c->display, "shm") &&
++      !has_switch(c->boot_args, "offline-legacy-unit-scale") &&
++      mode.width % 3 == 0 && mode.height % 3 == 0 && mode.height >= 1623) {
++    mode.width = mode.width / 3 * 2;
++    mode.height = mode.height / 3 * 2;
++    c->scale = 2;
++  }
++  return mode;
++}
++
+ bool xh_boot_args_hides_vmm_from(const char *args, const char *name)
+ {
+   static const char key[] = "owner-hide-vmm=";
+diff --git a/runtime/xnuhost/src/display.c b/runtime/xnuhost/src/display.c
+index 99eab5f..de5a100 100644
+--- a/runtime/xnuhost/src/display.c
++++ b/runtime/xnuhost/src/display.c
+@@ -469,7 +469,7 @@ static unsigned drm_w, drm_h;
+ static bool panel_native(xh_panel_mode *native) { (void)native; return false; }
+ #endif
+ 
+-int xh_display_init(const xh_config *c, unsigned *width, unsigned *height, unsigned *hz)
++int xh_display_init(xh_config *c, unsigned *width, unsigned *height, unsigned *hz)
+ {
+   direct_enabled = c->display_direct;
+   backend = !strcmp(c->display, "drm") ? BACK_DRM : !strcmp(c->display, "shm") ? BACK_SHM : BACK_NONE;
+@@ -487,7 +487,11 @@ int xh_display_init(const xh_config *c, unsigned *width, unsigned *height, unsig
+     reported = backend == BACK_SHM && helper_report(&panel);
+     known = reported || panel_native(&panel);
+   }
+-  xh_panel_mode mode = xh_display_mode(c, known ? &panel : NULL);
++  unsigned panel_scale = c->scale;
++  xh_panel_mode mode = xh_display_render_mode(c, known ? &panel : NULL);
++  if (c->scale != panel_scale)
++    LOGI("display: smaller backing %ux%u at @%ux, upscaled to %ux%u; panel stays at %u Hz",
++         mode.width, mode.height, c->scale, panel.width, panel.height, mode.hz);
+   display.width = mode.width;
+   display.height = mode.height;
+   *hz = mode.hz;
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index b1c8db5..130f2f8 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -559,6 +559,7 @@ static int boot(void)
+       metal_cdhashes = NULL;
+     } else {
+       LOGI("gpu: 24A446 Metal runtime selected on Galaxy S25+");
++      if (!config.display_render_scale) config.display_render_scale = 2;
+       // Keep governor control between cool, touch-triggered wake pulses.
+       if (!*config.gpu_level) strcpy(config.gpu_level, "touch-wake");
+       LOGI("gpu: S25+ Metal profile: KGSL level policy %s", config.gpu_level);
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index ced0bef..5fdd00b 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -86,6 +86,7 @@ typedef struct {
+   unsigned ndisk;
+   char  display[16];        // "shm", "drm", "none"
+   unsigned display_format;  // display-format=: the frame's pixels, XH_PIXELS_BGRX8 ("bgrx", the default) or XH_PIXELS_RGBA16F
++  int   display_render_scale;  // 0: automatic; 2: compact backing; 3: full backing for @3x screens
+   int   display_direct;     // 1: let a compatible helper read guest frames; 0: host copy; -1: unset
+                             // ("rgba16f": half floats, wide colour and EDR kept; the guest is told oneios-display-wide=1)
+   char  gpu[8];             // "auto" (3D when the host has KGSL, udmabuf and a dma heap), "3d" (or do not start), "2d"
+@@ -221,6 +222,7 @@ bool xh_panel_report(const void *message, size_t length, xh_panel_mode *panel);
+ // The guest's mode: width, height and hz where configured (command line, then the image set's xnuhost.conf), else
+ // the mode of the panel (NULL: not known), else 1440x3120 at 120 Hz.
+ xh_panel_mode xh_display_mode(const xh_config *c, const xh_panel_mode *panel);
++xh_panel_mode xh_display_render_mode(xh_config *c, const xh_panel_mode *panel);
+ // Adds the display driver's two switches to the kernel's command line unless it already has them:
+ // offline-legacy-unit-scale=SCALE (/chosen display-scale) and sheng-vsync=HZ (the vsync tick and, above 60 Hz,
+ // the refresh properties). -1: no room.
+@@ -635,7 +637,7 @@ typedef struct {
+   unsigned format, bpp;                 // XH_PIXELS_BGRX8 (4 bytes a pixel) or XH_PIXELS_RGBA16F (8): include/xnuhost/pixels.h
+   uint8_t *pixels;                      // xnuhost's shadow of the visible frame
+ } xh_display;
+-int   xh_display_init(const xh_config *c, unsigned *width, unsigned *height, unsigned *hz);
++int   xh_display_init(xh_config *c, unsigned *width, unsigned *height, unsigned *hz);
+ xh_display *xh_display_get(void);
+ // The rectangle changed (already copied into pixels).
+ void  xh_display_flush(unsigned x, unsigned y, unsigned w, unsigned h);
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 6a3cfb2..54c2bb7 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1983,6 +1983,25 @@ static void test_config(const char *dir)
+   CHECK(mode.width == 1260 && mode.height == 2800 && mode.hz == 144);                                // another panel: its own
+   native.hz = 0;
+   CHECK(xh_display_mode(&c, &native).hz == 120);                                                     // a mode without a rate
++  {
++    xh_config reduced;
++    xh_config_defaults(&reduced);
++    strcpy(reduced.mode, "takeover");
++    strcpy(reduced.display, "shm");
++    reduced.scale = 3;
++    CHECK(xh_config_set(&reduced, "display-render-scale", "2") == 0);
++    const xh_panel_mode panel = { 1080, 2340, 120 };
++    xh_panel_mode compact = xh_display_render_mode(&reduced, &panel);
++    CHECK(compact.width == 720 && compact.height == 1560 && compact.hz == 120 && reduced.scale == 2);
++    reduced.scale = 3;
++    strcpy(reduced.boot_args, "offline-legacy-unit-scale=3");
++    compact = xh_display_render_mode(&reduced, &panel);
++    CHECK(compact.width == 1080 && compact.height == 2340 && reduced.scale == 3);
++    reduced.boot_args[0] = 0;
++    CHECK(xh_config_set(&reduced, "display-render-scale", "3") == 0);
++    compact = xh_display_render_mode(&reduced, &panel);
++    CHECK(compact.width == 1080 && compact.height == 2340 && reduced.scale == 3);
++  }
+   char *mode1[] = { "xnuhost", "--image", image, "--width", "1320", "--height", "2868", "--hz", "60", "--scale", "2", "--set", "scale-fixup=0" };
+   xh_config_defaults(&c);
+   CHECK(xh_config_args(&c, 13, mode1) == 0 && xh_config_finish(&c) == 0 && c.scale == 2 && c.hz == 60 && c.scale_fixup == 0);
