@@ -1,0 +1,167 @@
+diff --git a/runtime/bridges/thermal/test_thermal.c b/runtime/bridges/thermal/test_thermal.c
+index 7f9cd14..83cfb78 100644
+--- a/runtime/bridges/thermal/test_thermal.c
++++ b/runtime/bridges/thermal/test_thermal.c
+@@ -310,7 +310,19 @@ static void test_early_cap(void)
+   put("/sys/class/power_supply/battery/lrp", "415\n");
+   wait_ms(150);
+   br_thermal_get(t, &state);
+-  CHECK(state.cap == 1);
++  CHECK(state.cap == BR_THERMAL_CAP_WARM);
++  put("/sys/class/power_supply/battery/lrp", "465\n");
++  wait_ms(150);
++  br_thermal_get(t, &state);
++  CHECK(state.cap == BR_THERMAL_CAP_HOT);
++  put("/sys/class/power_supply/battery/lrp", "452\n");
++  wait_ms(150);
++  br_thermal_get(t, &state);
++  CHECK(state.cap == BR_THERMAL_CAP_HOT);
++  put("/sys/class/power_supply/battery/lrp", "435\n");
++  wait_ms(150);
++  br_thermal_get(t, &state);
++  CHECK(state.cap == BR_THERMAL_CAP_WARM);
+   put("/sys/class/power_supply/battery/lrp", "390\n");
+   wait_ms(150);
+   br_thermal_get(t, &state);
+diff --git a/runtime/bridges/thermal/thermal.c b/runtime/bridges/thermal/thermal.c
+index 2845105..c23d0e9 100644
+--- a/runtime/bridges/thermal/thermal.c
++++ b/runtime/bridges/thermal/thermal.c
+@@ -454,9 +454,10 @@ static void say_level(const br_thermal_state *s, const br_thermal_state *was)
+ static unsigned session_cap(const br_thermal *t, const br_thermal_state *s)
+ {
+   if (t->cap_off) return 0;
+-  if (s->cap) return s->cap;
+-  return t->early_cpu_cap && (s->skin_level >= BR_THERMAL_MODERATE ||
+-                             s->battery_level >= BR_THERMAL_HEAVY || s->soc_level >= BR_THERMAL_TRAPPING) ? 1 : 0;
++  if (s->cap || !t->early_cpu_cap) return s->cap;
++  if (s->skin_level >= BR_THERMAL_TRAPPING || s->battery_level >= BR_THERMAL_HEAVY ||
++      s->soc_level >= BR_THERMAL_TRAPPING) return BR_THERMAL_CAP_HOT;
++  return s->skin_level >= BR_THERMAL_MODERATE ? BR_THERMAL_CAP_WARM : 0;
+ }
+ 
+ // With the lock held.
+@@ -548,7 +549,8 @@ br_thermal *br_thermal_open(const br_thermal_options *options)
+   t->cap_off = cap && !strcmp(cap, "0");
+   const char *early = getenv("ONEIOS_THERMAL_EARLY_CAP");
+   t->early_cpu_cap = options ? options->early_cpu_cap : early && !strcmp(early, "1");
+-  t->poll_ms = options && options->poll_ms ? options->poll_ms : BR_THERMAL_POLL_MS;
++  t->poll_ms = options && options->poll_ms ? options->poll_ms :
++               t->early_cpu_cap ? 2000u : BR_THERMAL_POLL_MS;
+   t->load_ms = options && options->load_ms ? options->load_ms : BR_THERMAL_LOAD_MS;
+   br_host_load_read(t->sensors.root, &t->load);
+   br_thermal_raw raw;
+diff --git a/runtime/bridges/thermal/thermal.h b/runtime/bridges/thermal/thermal.h
+index e5144ca..5dc2a70 100644
+--- a/runtime/bridges/thermal/thermal.h
++++ b/runtime/bridges/thermal/thermal.h
+@@ -66,7 +66,9 @@ void br_thermal_decide(const br_thermal_limits *l, const br_thermal_raw *raw, co
+ // at SLEEPING (50 C) or the battery rule at TRAPPING (50 C); then BR_THERMAL_CAP_CRITICAL, only the slowest P domain and
+ // the E cores. The SoC is the kernel's (its own trips and LMh). br_cpu_thermal_mask (bridges.h) turns a step into CPUs
+ // (it still knows steps 1 and 3: thermalctl prints them).
++#define BR_THERMAL_CAP_WARM     1u
+ #define BR_THERMAL_CAP_CRITICAL 2u
++#define BR_THERMAL_CAP_HOT      3u  // scheduler relief only; retains warm-stage affinity
+ unsigned br_thermal_cap_for(const br_thermal_state *s);
+ const char *br_thermal_level_name(unsigned level);
+ // Whether a new state is worth a message: a new level or cap at once, otherwise after BR_THERMAL_REPORT_MS.
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index 6289186..6b3ee08 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -409,9 +409,9 @@ int xh_config_finish(xh_config *c)
+   // The guest's RAM: the command line's ram=, else the image set's, else auto.
+   if (!c->ram_given && from_image.ram_given) c->ram_bytes = from_image.ram_bytes;
+   if (c->ram_percent < 0) c->ram_percent = from_image.ram_percent < 0 ? XH_RAM_AUTO_PERCENT : from_image.ram_percent;
+-  // This phone's OneOS automatic profile starts at 45%. The fit rounds 54% to
+-  // 5888 MiB, one step above the previous 5632 MiB, when the host has room.
+-  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 54;
++  // This phone's OneOS automatic profile starts at 45%. The fit rounds 56% to
++  // 6144 MiB, one step above the previous 5888 MiB, when the host has room.
++  if (c->s25plus && !c->ram_bytes && c->ram_percent == 45) c->ram_percent = 56;
+   if (c->ram_host_floor < 0) c->ram_host_floor = from_image.ram_host_floor < 0 ? (int64_t)XH_RAM_AUTO_FLOOR : from_image.ram_host_floor;
+   if (c->host_mem_log < 0) c->host_mem_log = from_image.host_mem_log < 0 ? 30 : from_image.host_mem_log;
+   if (c->usb_log < 0) c->usb_log = from_image.usb_log < 0 ? 3 : from_image.usb_log;
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index b1c8db5..7a80b69 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -370,9 +370,18 @@ static void thermal_step(void *ctx, const br_thermal_state *state)
+   if (config.s25plus)
+     __atomic_store_n(&xh_cpu_thermal_step, state->cap, __ATOMIC_RELAXED);
+   if (!cpu_planned) return;
+-  br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, state->cap);
+-  __atomic_fetch_add(&xh_cpu_place_epoch, 1, __ATOMIC_ACQ_REL);
+-  for (unsigned i = 0; i < cpu_plan.nvcpu; i++) { int tid = vcpu_tid(i); if (tid > 0) place(tid, i); }
++  uint64_t before[XH_MAX_CPUS];
++  for (unsigned i = 0; i < cpu_plan.nvcpu; i++) before[i] = place_mask(i);
++  unsigned affinity_step = state->cap == BR_THERMAL_CAP_HOT ? BR_THERMAL_CAP_WARM : state->cap;
++  br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, affinity_step);
++  bool changed = false;
++  for (unsigned i = 0; i < cpu_plan.nvcpu; i++) {
++    if (before[i] == place_mask(i)) continue;
++    changed = true;
++    int tid = vcpu_tid(i);
++    if (tid > 0) place(tid, i);
++  }
++  if (changed) __atomic_fetch_add(&xh_cpu_place_epoch, 1, __ATOMIC_ACQ_REL);
+   uint64_t p = cpu_plan.nvcpu ? __atomic_load_n(&cpu_plan.v[cpu_plan.nvcpu - 1].affinity, __ATOMIC_ACQUIRE) : 0;
+   LOGI("thermal: step %u (%s): P vCPUs on host CPUs 0x%llx%s", state->cap, br_thermal_level_name(state->level), (unsigned long long)p,
+        state->cap ? "" : " (all of their kind)");
+diff --git a/runtime/xnuhost/src/task.c b/runtime/xnuhost/src/task.c
+index f365cba..38fb1e5 100644
+--- a/runtime/xnuhost/src/task.c
++++ b/runtime/xnuhost/src/task.c
+@@ -12,6 +12,7 @@
+ // page and two futex words.
+ #define _GNU_SOURCE
+ #include "xnuhost.h"
++#include "../../bridges/thermal/thermal.h"
+ #include "../stub/stub_abi.h"
+ #include <errno.h>
+ #include <dirent.h>
+@@ -891,11 +892,15 @@ int64_t xh_thread_run(xh_vcpu *v, uint64_t handle, struct xh_user_state *state,
+     if (step) {
+       // Apply thermal relief after the guest's hint so it cannot reinstate a high floor.
+       // Preserve foreground headroom and trim only background demand.
+-      const unsigned limit = step > 1 ? 512 : 640;
+-      if ((hint & (XH_HINT_VALID | XH_HINT_BACKGROUND)) == (XH_HINT_VALID | XH_HINT_BACKGROUND))
+-        hi = limit;
+-      // Requests within one step share a floor, avoiding repeated scheduler writes while warm.
+-      lo = (lo < limit ? lo : limit) & ~63u;
++      const unsigned background_limit = step == BR_THERMAL_CAP_WARM ? 640 : 512;
++      const bool background = (hint & (XH_HINT_VALID | XH_HINT_BACKGROUND)) ==
++                              (XH_HINT_VALID | XH_HINT_BACKGROUND);
++      if (background) hi = background_limit;
++      // Leave more headroom for UI and audio at the first warm stage.
++      const bool latency_sensitive = (hint & XH_HINT_VALID) && (hint & (XH_HINT_UI | XH_HINT_REALTIME));
++      const unsigned floor_limit = step == BR_THERMAL_CAP_WARM && latency_sensitive ? 768 :
++                                   step == BR_THERMAL_CAP_CRITICAL ? 512 : 640;
++      lo = (lo < floor_limit ? lo : floor_limit) & ~63u;
+     }
+     const uint32_t want = (lo | hi << 11) + 1;
+     uint32_t tid = __atomic_load_n(&tp->tid, __ATOMIC_ACQUIRE);
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 3530fe8..ec8f770 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1785,8 +1785,8 @@ static void test_config(const char *dir)
+   // 552 - 256 = 841 MiB of MemAvailable, the valve's 256 MiB and 585 MiB more for what else grows (that session's growth
+   // outside the guest besides page tables and zram was about 300-350 MiB [estimate from its meminfo]).
+   CHECK(8561 * M - 6912 * M - 6912 * M * PT / 100 - GR > XH_RAM_UNLOCK_BELOW + 512 * M);
+-  CHECK(xh_ram_fit_auto(11113 * M, 54, XH_RAM_AUTO_FLOOR, 7322 * M, NULL) == 5888 * M);
+-  CHECK(xh_ram_fit_auto(11113 * M, 54, XH_RAM_AUTO_FLOOR, 5380 * M, NULL) == 5376 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 56, XH_RAM_AUTO_FLOOR, 7322 * M, NULL) == 6144 * M);
++  CHECK(xh_ram_fit_auto(11113 * M, 56, XH_RAM_AUTO_FLOOR, 5380 * M, NULL) == 5376 * M);
+   char set_meminfo[340], set_small[340], set_none[340];
+   snprintf(set_meminfo, sizeof set_meminfo, "ram-meminfo=%s", meminfo);
+   snprintf(set_small, sizeof set_small, "ram-meminfo=%s", small);
+@@ -1814,7 +1814,7 @@ static void test_config(const char *dir)
+   xh_config_defaults(&c);
+   c.s25plus = true;
+   CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "ram-percent", "45") == 0 && xh_config_finish(&c) == 0);
+-  CHECK(c.ram_percent == 54 && strstr(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=60"));
++  CHECK(c.ram_percent == 56 && strstr(c.boot_args, "memorystatus_reaper_minimum_age_apps_seconds=60"));
+   xh_config_defaults(&c);
+   c.s25plus = true;
+   CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "boot-args", "memorystatus_reaper_minimum_age_apps_seconds=120") == 0 &&
