@@ -1,0 +1,35 @@
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 0c79444..5ae5eb3 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -367,16 +367,8 @@ static int vcpu_tid(unsigned vcpu) { return vcpu < g_ncpu ? g_vcpu[vcpu].tid : 0
+ static void thermal_step(void *ctx, const br_thermal_state *state)
+ {
+   (void)ctx;
+-  if (config.s25plus) {
++  if (config.s25plus)
+     __atomic_store_n(&xh_cpu_thermal_step, state->cap, __ATOMIC_RELAXED);
+-    if (state->cap == BR_THERMAL_CAP_CRITICAL) {
+-      LOGI("thermal: returning to One UI at the %s limit",
+-           state->skin_level >= BR_THERMAL_SLEEPING ? "case temperature" : "battery temperature");
+-      session_file("return.request", "OneiOS thermal limit reached\n");
+-      xh_stop(XH_HALT_RETURN, 0, "OneiOS thermal limit reached");
+-      return;
+-    }
+-  }
+   if (!cpu_planned) return;
+   uint64_t before[XH_MAX_CPUS];
+   for (unsigned i = 0; i < cpu_plan.nvcpu; i++) before[i] = place_mask(i);
+@@ -1461,11 +1453,7 @@ int main(int argc, char **argv)
+   xh_ramfix_stop(&g_ramfix);
+   LOGI("memory: the guest's RAM: %llu MiB held to the end, %llu MiB of it locked; the exit gives all of it back to the host",
+        (unsigned long long)(g_mem.size >> 20), (unsigned long long)(__atomic_load_n(&g_ramfix.locked, __ATOMIC_RELAXED) >> 20));
+-  if (stop_state.reason == XH_HALT_RETURN) {
+-    char request[100];
+-    snprintf(request, sizeof request, "%s\n", stop_state.why);
+-    session_file("return.request", request);
+-  }
++  if (stop_state.reason == XH_HALT_RETURN) session_file("return.request", "the guest asked to return\n");
+   if (stop_state.reason == XH_HALT_RESTART) guest_restart();     // returns only if it could not
+   int code = stop_state.reason == XH_HALT_RESTART ? EXIT_RESTART : stop_state.reason == XH_HALT_PANIC ? EXIT_PANIC :
+              stop_state.code ? EXIT_PANIC : EXIT_GUEST_OFF;
