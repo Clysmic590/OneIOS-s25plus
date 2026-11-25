@@ -1,0 +1,80 @@
+diff --git a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
+index cce2435..9ce3c04 100644
+--- a/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
++++ b/app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Oneios.kt
+@@ -60,7 +60,13 @@ object OneiosSystem {
+      * Galaxy A56 (SM-A566, a56x, s5e8855; OneiOS issue 73), which makes and starts iOS 16.5 (20F66), not iOS 27
+      * ([OneiosImageChoice.of]). The A56 path has not run on an A56 yet (untested on hardware).
+      */
+-    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_ULTRA_8650, Profiles.ID_A56)
++    val PROFILE_IDS: Set<String> = setOf(
++        Profiles.ID_S_ULTRA_8650,
++        Profiles.ID_S_8750,
++        Profiles.ID_S_PLUS_8750,
++        Profiles.ID_S_ULTRA_8750,
++        Profiles.ID_A56,
++    )
+ 
+     /**
+      * The phone it is mainly tested and working on: the Galaxy S24 Ultra (SM-S928, e3q, SM8650); every other phone,
+diff --git a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
+index 0ecc109..751e2bc 100644
+--- a/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
++++ b/app-android/core/model/src/test/kotlin/com/fahadali/oneos/core/model/OneiosTest.kt
+@@ -50,8 +50,9 @@ class OneiosTest {
+ 
+     @Test
+     fun theGalaxyS24UltraAndTheA56AreOfferedOnlyTheS24UltraIsTested() {
++        val offered = setOf("s-ultra-8650", "s-8750", "s-plus-8750", "s-ultra-8750", Profiles.ID_A56)
+         for (p in Profiles.BUILT_IN) {
+-            assertEquals(p.id, p.id == Profiles.ID_S_ULTRA_8650 || p.id == Profiles.ID_A56, OneiosSystem.offeredOn(p))
++            assertEquals(p.id, p.id in offered, OneiosSystem.offeredOn(p))
+             assertEquals(p.id, p.id == Profiles.ID_S_ULTRA_8650, OneiosSystem.testedOn(p))
+         }
+         assertFalse(OneiosSystem.offeredOn(null))
+@@ -64,7 +65,9 @@ class OneiosTest {
+         assertFalse(OneiosSystem.testedOn(Profiles.resolve("SM-A566B", "a56x", "s5e8855").profile))
+         // The same model number on another chip or codename is not that phone.
+         assertFalse(OneiosSystem.offeredOn("SM-S928B", "e3s", "s5e9945"))
+-        assertFalse(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S938B", "pa3q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S936B", "pa2q", "SM8750"))
++        assertTrue(OneiosSystem.offeredOn("SM-S931B", "pa1q", "SM8750"))
+         assertFalse(OneiosSystem.offeredOn("SM-S921B", "e1q", "SM8650"))
+         assertFalse(OneiosSystem.offeredOn("SM-F976B", "q8q", "SM8850"))
+         assertFalse(OneiosSystem.offeredOn("SM-A576B", "a57x", "s5e8865"))
+diff --git a/switcher/assets/oneios_switch.sh b/switcher/assets/oneios_switch.sh
+index aa31f4d..cd03517 100644
+--- a/switcher/assets/oneios_switch.sh
++++ b/switcher/assets/oneios_switch.sh
+@@ -577,10 +577,17 @@ clocks_save() {
+ clocks_tops() {
+     # The mark first: from here the return writes One UI's values back.
+     echo "$(date +%s)" > "$CTL/clocks.set"
++    case "$(getprop ro.product.model)" in
++        SM-S931*|SM-S936*|SM-S938*) preserve_max=1 ;;
++        *) preserve_max=0 ;;
++    esac
+     while read -r node old new; do
+         case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;;
+             /sys/devices/system/cpu/cpufreq_limit/cpufreq_max_limit|/sys/devices/system/cpu/cpufreq_limit/cpufreq_min_limit) ;; *) continue ;; esac
+         case "${old#-}${new#-}" in ''|*[!0-9]*) continue ;; esac
++        case "$preserve_max:$node" in
++            1:*/scaling_max_freq|1:*/cpufreq_max_limit|1:*/gpu_max_clock|1:*/max_gpuclk) continue ;;
++        esac
+         if echo "$new" > "$T$node" 2>/dev/null; then
+             echo "clocks: $node $old -> $new (reads $(cat "$T$node" 2>/dev/null))"
+         else
+@@ -1801,6 +1808,12 @@ end_for_return() { # <step>: the switch ends; the return (already under way, or
+ return_asked && end_for_return "One UI's framework was stopped"
+ 
+ echo "=== [3/5] $(date +%T) Stopping the One UI framework ==="
++if "$BB" timeout 5 /system/bin/cmd activity kill-all; then
++    echo "Closed reclaimable Android background apps"
++else
++    echo "Android background app cleanup unavailable; continuing with the framework stop"
++fi
++return_asked && end_for_return "One UI's framework was stopped"
+ # The boot screen first, so that it is up when One UI's windows go.
+ bootui_begin
+ # The watchdog device(s) One UI's system_server keeps open, before it stops

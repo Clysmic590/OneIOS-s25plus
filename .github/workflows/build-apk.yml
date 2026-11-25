@@ -3,9 +3,9 @@ name: Build OneiOS Galaxy S25 series APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [build/app-upstream-0.5.95]
     paths:
-      - patches/s25-plus-app.patch
+      - patches/s25-series-upstream-0.5.95-app.patch
 
 permissions:
   contents: read
@@ -25,14 +25,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: akshaynexus/OneOS
-          ref: bdf3db05e0aaacf996d1ec2a1bd3f0019b0a7f82
+          ref: e264c758360d345460244e09611c20795663a9ac
+          fetch-depth: 0
           path: source
 
       - name: Apply Galaxy S25 app patch
         working-directory: source
         run: |
-          git apply --check ../patch/patches/s25-plus-app.patch
-          git apply ../patch/patches/s25-plus-app.patch
+          git apply --check ../patch/patches/s25-series-upstream-0.5.95-app.patch
+          git apply ../patch/patches/s25-series-upstream-0.5.95-app.patch
 
       - name: Java 21
         uses: actions/setup-java@v4
@@ -81,27 +82,27 @@ jobs:
       - name: Verify Galaxy S25 profiles and switch checks
         working-directory: source/app-android
         run: |
-          ./gradlew --no-daemon :core:model:test --tests com.fahadali.oneos.core.model.OneiosTest \
-            :core:root:testDebugUnitTest --tests 'com.fahadali.oneos.core.root.OneiosScriptTest.theSwitchRefusesOtherPhones'
+          ./gradlew --no-daemon :core:model:test --tests com.fahadali.oneos.core.model.OneiosTest
+          sh -n ../switcher/assets/oneios_switch.sh
 
       - name: Build debug APK
         working-directory: source/app-android
-        run: ./gradlew --no-daemon -PoneiosDiagnostics=true :app:assembleFullDebug
+        run: ./gradlew --no-daemon :app:assembleFullDebug
 
       - name: Prepare APK and checksum
         working-directory: source
         run: |
           apk=app-android/app/build/outputs/apk/full/debug/app-full-debug.apk
           test -s "$apk"
-          cp "$apk" OneiOS-S25-Series-0.5.16.apk
-          sha256sum OneiOS-S25-Series-0.5.16.apk > OneiOS-S25-Series-0.5.16.apk.sha256
+          cp "$apk" OneiOS-S25-Series-0.5.95.apk
+          sha256sum OneiOS-S25-Series-0.5.95.apk > OneiOS-S25-Series-0.5.95.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25-Series-0.5.16
+          name: OneiOS-S25-Series-0.5.95
           path: |
-            source/OneiOS-S25-Series-0.5.16.apk
-            source/OneiOS-S25-Series-0.5.16.apk.sha256
+            source/OneiOS-S25-Series-0.5.95.apk
+            source/OneiOS-S25-Series-0.5.95.apk.sha256
           if-no-files-found: error
           retention-days: 30

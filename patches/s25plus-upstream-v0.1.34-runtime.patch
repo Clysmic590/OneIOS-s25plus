@@ -1,0 +1,732 @@
+diff --git a/runtime/bridges/audio/aaudio_helper.rs b/runtime/bridges/audio/aaudio_helper.rs
+index bb29293..c33ad24 100644
+--- a/runtime/bridges/audio/aaudio_helper.rs
++++ b/runtime/bridges/audio/aaudio_helper.rs
+@@ -60,6 +60,16 @@
+ //!      a normal mixer track (libaudioclient takes FAST off a synchronous native writer; what LOW_LATENCY still sends
+ //!      is AUDIO_OUTPUT_FLAG_RAW). ONEIOS_AUDIO_PERF=none: performance mode NONE (the path before 2026-11-15).
+ //!
++//! A stream whose server takes no frames: on the S25's HAL an MMAP exclusive stream sometimes never leaves STARTING (no
++//! timestamp, every blocking write times out with 0, the DSP never reads: sessions 3, 4 and 5), and the writer would
++//! drop every guest period for as long as the track lingered. Two places notice and reopen the speaker on 3, once for
++//! the helper's run (mmap_dead below): the probe, when the writer says the stream is dead or after 1.5 s with no read
++//! (before the guest's boot, so iOS's first sound already finds the mixer track; the boot costs about a second more),
++//! and the writer, when three writes in a
++//! row take nothing (600 ms: the stream never started, so AAudio holds nothing) or AAudio holds frames the server has
++//! not read for 1 s (it stopped; the receive loop closes the stream and opens the mixer track while the guest's stream
++//! stays up: a gap of the ring's fill). The fallback is logged; after it no open asks for MMAP again.
++//!
+ //! And a guard: every thread of the process is checked after each start and every 10 s, and one found SCHED_FIFO or
+ //! SCHED_RR is set back to SCHED_OTHER (logged).
+ //!
+@@ -70,7 +80,9 @@
+ //! presented).
+ //!
+ //! The probe (AU_PROBE, xnuhost before the boot): the speaker stream opened in silence, its latency measured and sent
+-//! back, so the kernel publishes the host's measured latency as the device's output latency.
++//! back, so the kernel publishes the host's measured latency as the device's output latency. A stream that takes no
++//! frame (the writer's 600 ms, or the probe's 1.5 s) is reopened on 3 (above); a mixer track's silence is not measured
++//! (0: the guest's first period starts it).
+ //!
+ //!
+ //! Log lines: "oneios-audio: ..." on stderr (xnuhost's log): each stream's open (its mode), the server's pulls once they
+@@ -408,6 +420,10 @@ pub struct Ring {
+     pub out_path: OutPath,
+     /// its reader (the DSP, AAudio's endpoint) takes frames all the time
+     pub continuous: bool,
++    /// The writer saw the server take nothing (600 ms of timed-out writes, or a second with AAudio's frames unread) on
++    /// a stream that is not the legacy track: the receive loop reopens the speaker on the legacy path (once, mmap_dead
++    /// on the Helper).
++    dead: bool,
+ }
+ 
+ impl Ring {
+@@ -431,9 +447,15 @@ impl Ring {
+             target_max_ms: 80,
+             out_path: OutPath::Legacy,
+             continuous: false,
++            dead: false,
+         }
+     }
+ 
++    /// the ring's level and the writer's target, for the reports and the tests
++    pub fn playing(&self) -> bool {
++        self.guest_on
++    }
++
+     /// One guest period has come in: its lateness against the guest's schedule (the earliest arrival of the last one
+     /// to two seconds less its sample time) plus what the ring and AAudio hold ahead of it (`ahead`, frames; None: no
+     /// timestamp yet) is its end to end, from iOS's sample time to the speaker.
+@@ -485,6 +507,7 @@ impl Ring {
+     fn restart(&mut self) {
+         self.guest_on = true;
+         self.generation += 1;
++        self.dead = false;
+         self.stats = OutStats::default();
+         self.clock = GuestClock::default();
+     }
+@@ -544,6 +567,8 @@ pub struct Helper {
+     in_thread: Mutex<Option<JoinHandle<()>>>,
+     /// AAudio_setMMapPolicy(NEVER) worked
+     mmap_refused: AtomicBool,
++    /// a stream's server took no frames (no timestamp, 600 ms of timed-out writes): no open asks for MMAP again
++    mmap_dead: AtomicBool,
+     /// the output latency iOS was told (AU_TOLD; 0: not known)
+     told_frames: AtomicU32,
+     host_volume: Mutex<HostVolume>,
+@@ -654,6 +679,7 @@ impl Helper {
+             out_thread: Mutex::new(None),
+             in_thread: Mutex::new(None),
+             mmap_refused: AtomicBool::new(false),
++            mmap_dead: AtomicBool::new(false),
+             told_frames: AtomicU32::new(0),
+             host_volume: Mutex::new(HostVolume::default()),
+             idle_since: Mutex::new(0.0),
+@@ -844,7 +870,9 @@ impl Helper {
+         let mut path = OutPath::Legacy;
+         let mut why = String::new();
+         let mut asked;
+-        if s.perf_mode == PERF_LOW_LATENCY && s.mmap_want != MmapWant::Off {
++        if self.mmap_dead.load(Ordering::Relaxed) {
++            why = "an earlier MMAP stream's server took no frames".to_owned();
++        } else if s.perf_mode == PERF_LOW_LATENCY && s.mmap_want != MmapWant::Off {
+             // Without AAudio_setMMapPolicy the system's aaudio.mmap_policy decides (2, AUTO, on the phone).
+             let _ = self.mmap_policy(POLICY_AUTO);
+             self.mmap_refused.store(false, Ordering::Relaxed);
+@@ -880,8 +908,10 @@ impl Helper {
+                 return (stream, asked, why);
+             }
+         } else {
+-            why = if s.perf_mode == PERF_LOW_LATENCY { "ONEIOS_AUDIO_MMAP=off" } else { "ONEIOS_AUDIO_PERF=none" }
+-                .to_owned();
++            if why.is_empty() {
++                why = if s.perf_mode == PERF_LOW_LATENCY { "ONEIOS_AUDIO_MMAP=off" } else { "ONEIOS_AUDIO_PERF=none" }
++                    .to_owned();
++            }
+         }
+         self.mmap_off();
+         asked = if self.mmap_refused.load(Ordering::Relaxed) { s.perf_mode } else { PERF_NONE };
+@@ -1072,6 +1102,12 @@ impl Helper {
+         let mut phase = false;
+         let mut xruns_seen = d.stream.xrun_count();
+         let mut reported = d.started();
++        // The server's read and when it last moved: a stream AAudio holds frames for and that does not take them for a
++        // second is dead (an MMAP stream whose DSP never started, or stopped), and the receive loop replaces it.
++        let mut read_seen = d.stream.frames_read();
++        let mut read_moved = time::monotonic_s();
++        // writes in a row the server took nothing of (200 ms each): its DSP never started
++        let mut idle = 0u32;
+         self.boost_writer();
+         let mut fitted = {
+             let mut r = self.ring();
+@@ -1084,6 +1120,23 @@ impl Helper {
+             let queued = (d.stream.frames_written() - read).max(0);
+             let xruns = d.stream.xrun_count();
+             let now = time::monotonic_s();
++            // Its DSP never started (no timestamp; this phone's HAL does it now and then) or stopped: AAudio holds
++            // frames and takes none for a second. The receive loop reopens the speaker on the legacy path, once.
++            if read != read_seen {
++                read_seen = read;
++                read_moved = now;
++            } else if queued > 0 && now - read_moved >= 1.0 {
++                let mut r = self.ring();
++                if r.out_path != OutPath::Legacy {
++                    r.dead = true;
++                    drop(r);
++                    eprintln!(
++                        "oneios-audio: speaker: the server took no frames in 1 s: the speaker is reopened as a mixer \
++                         track"
++                    );
++                    break;
++                }
++            }
+             let (mut take, mut length) = (0u32, CHUNK);
+             let (mut play, mut cut) = (false, false);
+             let mut r = self.ring();
+@@ -1324,7 +1377,28 @@ impl Helper {
+                         std::thread::sleep(Duration::from_millis(50));
+                         break;
+                     }
+-                    done += n as u32; // 0: the server took nothing for 200 ms (a stall): again
++                    if n == 0 {
++                        // The server took nothing for 200 ms. Three in a row (600 ms) on a stream that is not the mixer
++                        // track: its DSP never started (no timestamp; this phone's HAL does it on some MMAP exclusive
++                        // opens) and no write will go in; AAudio holds nothing, so the read alone cannot tell. The
++                        // receive loop reopens the speaker on the legacy path, once.
++                        idle += 1;
++                        if idle >= 3 {
++                            let mut r = self.ring();
++                            if r.out_path != OutPath::Legacy {
++                                r.dead = true;
++                                drop(r);
++                                eprintln!(
++                                    "oneios-audio: speaker: the server took nothing in 600 ms: the speaker is reopened \
++                                     as a mixer track"
++                                );
++                                break;
++                            }
++                        }
++                        continue;
++                    }
++                    idle = 0;
++                    done += n as u32;
+                     d.frames.fetch_add(n as u64, Ordering::Relaxed);
+                 }
+             }
+@@ -1333,6 +1407,9 @@ impl Helper {
+                 self.out_report("running");
+                 demote_realtime();
+             }
++            if self.ring().dead {
++                break; // the receive loop reopens the speaker (restart_speaker)
++            }
+         }
+     }
+ 
+@@ -1519,58 +1596,107 @@ impl Helper {
+         self.ring_more.notify_one();
+     }
+ 
++    /// The writer saw the server take no frames for 1 s (its DSP never started, or stopped): the speaker closed and
++    /// opened again on the legacy path (mmap_dead), the guest's stream kept (guest_on, which stop_dir clears: put back
++    /// after). 0 or start_dir's errno.
++    fn restart_speaker(self: &Arc<Helper>) -> i32 {
++        let Some(d) = self.dir(true) else { return 0 };
++        let (rate, channels) = (d.stream.sample_rate().max(0) as u32, d.channels);
++        let guest_on = self.ring().guest_on;
++        self.mmap_dead.store(true, Ordering::Relaxed);
++        self.stop_dir(true);
++        let rc = self.start_dir(true, rate, channels);
++        if rc != 0 {
++            return rc;
++        }
++        self.ring().guest_on = guest_on; // the guest's stream is up: its next period plays on the new track
++        if !guest_on {
++            *locked(&self.idle_since) = time::monotonic_s();
++        }
++        0
++    }
++
+     /// AU_PROBE (xnuhost, before the guest boots): the speaker's stream opened now and kept in silence (it lingers, so
+     /// iOS's first sound finds it open), and its latency for a guest period: what AAudio holds below its read (the
+     /// median of 10 looks once the server reads and gives a timestamp, up to 1.5 s for that: a mixer track's start
+     /// stall is about 200 ms) plus the level the writer holds when a period comes in (the target; on a mixer also half
+     /// a pull). Frames (0: not measured).
+     fn probe(self: &Arc<Helper>) -> u32 {
+-        if self.dir(true).is_none() {
+-            if self.start_dir(true, RATE, 2) != 0 {
+-                eprintln!("oneios-audio: probe: the speaker did not open");
++        // Two tries: the stream on the configured path, then (when its server took no frame) one on the legacy path.
++        // The answer must come well within xnuhost's 2 s (session/bridges.rs): a dead stream is given up as soon as
++        // the writer says so (its 600 ms of timed-out writes or a second with AAudio's frames unread), and the legacy
++        // path is not waited on at all (its silence never reaches AudioFlinger's start threshold without the guest).
++        for attempt in 0..2 {
++            if self.dir(true).is_none() {
++                if self.start_dir(true, RATE, 2) != 0 {
++                    eprintln!("oneios-audio: probe: the speaker did not open");
++                    return 0;
++                }
++                self.ring().guest_on = false; // silence until the guest's START, then the linger
++                *locked(&self.idle_since) = time::monotonic_s();
++            }
++            let Some(d) = self.dir(true) else { return 0 };
++            if attempt != 0 {
++                eprintln!(
++                    "oneios-audio: probe: not measured on the mixer track (it starts on the guest's first period)"
++                );
+                 return 0;
+             }
+-            self.ring().guest_on = false; // silence until the guest's START, then the linger
+-            *locked(&self.idle_since) = time::monotonic_s();
+-        }
+-        let Some(d) = self.dir(true) else { return 0 };
+-        let mut samples = Vec::with_capacity(10);
+-        for _ in 0..150 {
+-            if samples.len() >= 10 {
+-                break;
++            let mut samples = Vec::with_capacity(10);
++            for _ in 0..150 {
++                if samples.len() >= 10 || self.ring().dead {
++                    break;
++                }
++                std::thread::sleep(Duration::from_millis(10));
++                if d.stream.frames_read() > 0 {
++                    if let Some(below) = d.below_read() {
++                        samples.push(below);
++                    }
++                }
+             }
+-            std::thread::sleep(Duration::from_millis(10));
+-            if d.stream.frames_read() > 0 {
+-                if let Some(below) = d.below_read() {
+-                    samples.push(below);
++            if samples.is_empty() || self.ring().dead {
++                let path = self.ring().out_path;
++                if path != OutPath::Legacy {
++                    // The server never took a frame: the MMAP stream's DSP did not start (this phone's HAL does it
++                    // now and then). The writer would then wait 200 ms per write forever and drop every guest period:
++                    // the legacy mixer track instead.
++                    self.mmap_dead.store(true, Ordering::Relaxed);
++                    eprintln!(
++                        "oneios-audio: probe: the server took no frames on {}: reopened as a mixer track",
++                        path_name(path)
++                    );
++                    self.stop_dir(true);
++                    continue;
+                 }
++                eprintln!(
++                    "oneios-audio: probe: no timestamp from the speaker's stream in 1.5 s: not measured (a mixer \
++                     track starts on the guest's first period)"
++                );
++                return 0;
+             }
+-        }
+-        if samples.is_empty() {
+-            eprintln!("oneios-audio: probe: no timestamp from the speaker's stream in 1.5 s: not measured");
+-            return 0;
+-        }
+-        samples.sort_unstable();
+-        let median = samples[samples.len() / 2] as u32;
+-        let (level, path) = {
+-            let r = self.ring();
+-            let extra = match r.out_path {
+-                OutPath::MmapShared => d.burst,
+-                _ if r.continuous => 0,
+-                _ => (if r.pulls.size != 0 { r.pulls.size } else { d.burst }) / 2,
++            samples.sort_unstable();
++            let median = samples[samples.len() / 2] as u32;
++            let (level, path) = {
++                let r = self.ring();
++                let extra = match r.out_path {
++                    OutPath::MmapShared => d.burst,
++                    _ if r.continuous => 0,
++                    _ => (if r.pulls.size != 0 { r.pulls.size } else { d.burst }) / 2,
++                };
++                (r.target + extra, r.out_path)
+             };
+-            (r.target + extra, r.out_path)
+-        };
+-        let frames = median + level;
+-        eprintln!(
+-            "oneios-audio: probe: speaker latency {frames} frames ({} ms) on {}: {} ms below AAudio's read + {} ms of level \
+-             when a period comes in",
+-            frames_ms(frames),
+-            path_name(path),
+-            frames_ms(median),
+-            frames_ms(level)
+-        );
+-        frames
++            let frames = median + level;
++            eprintln!(
++                "oneios-audio: probe: speaker latency {frames} frames ({} ms) on {}: {} ms below AAudio's read + {} ms \
++                 of level when a period comes in",
++                frames_ms(frames),
++                path_name(path),
++                frames_ms(median),
++                frames_ms(level)
++            );
++            return frames;
++        }
++        0
+     }
+ 
+     /// The receive loop until xnuhost closes its end: 0.
+@@ -1605,6 +1731,13 @@ impl Helper {
+         );
+         let mut packet = vec![0u8; AU_HEADER + AU_MAX_FRAMES as usize * 4];
+         loop {
++            if self.ring().dead {
++                let rc = self.restart_speaker();
++                if rc != 0 {
++                    self.report(true, rc);
++                }
++                continue;
++            }
+             let mut wait = libc::pollfd { fd: self.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+             // SAFETY: one valid pollfd.
+             if unsafe { libc::poll(&mut wait, 1, 1000) } == 0 {
+diff --git a/runtime/bridges/audio/test_audio_helper.rs b/runtime/bridges/audio/test_audio_helper.rs
+index ef13adb..1264292 100644
+--- a/runtime/bridges/audio/test_audio_helper.rs
++++ b/runtime/bridges/audio/test_audio_helper.rs
+@@ -78,6 +78,9 @@ struct Knobs {
+     mmap_burst: i32,
+     mmap_capacity: i32,
+     mmap_below: i64,
++    /// An MMAP stream whose reader never takes a frame (the DSP did not start: the S25's HAL now and then); set while
++    /// a run is going and that stream's server stops taking too (what the S25's dead stream did: nothing).
++    dead_mmap: bool,
+     /// The audio policy's media index on the speaker (fix-audio-volume).
+     media_index: i32,
+     media_sets: u32,
+@@ -203,7 +206,9 @@ impl FakeStream {
+             let now = time::monotonic_s();
+             self.fake.late(now - due);
+             let pull = i64::from(self.pull);
+-            let took = if self.mmap {
++            let took = if self.mmap && self.fake.k().dead_mmap {
++                false // the DSP never started (or stopped): the stream takes nothing
++            } else if self.mmap {
+                 // A short buffer is an xrun (the DSP plays what is there, then stale data or silence). Counted in the
+                 // client's frames, as AAudio's catch-up keeps them: the read never passes the write.
+                 let have = s.written - s.read;
+@@ -315,7 +320,7 @@ impl AStream for FakeStream {
+     fn timestamp(&self) -> Option<(i64, i64)> {
+         let s = self.st();
+         let below = self.fake.k().mmap_below;
+-        let ok = s.pulls_done > 0 && (!self.mmap || s.read >= below);
++        let ok = s.pulls_done > 0 && !self.fake.k().dead_mmap && (!self.mmap || s.read >= below);
+         // MMAP: the HAL and the DSP after the read
+         ok.then(|| (if self.mmap { s.read - below } else { s.read }, (s.last_pull * 1e9) as i64))
+     }
+@@ -362,7 +367,7 @@ impl AStream for FakeStream {
+     fn frames_read(&self) -> i64 {
+         let s = self.st();
+         let mut v = s.read;
+-        if self.mmap && s.pulls_done != 0 {
++        if self.mmap && s.pulls_done != 0 && !self.fake.k().dead_mmap {
+             let on = ((time::monotonic_s() - s.last_pull) * f64::from(self.rate)) as i64;
+             v += on.clamp(0, i64::from(self.pull));
+             if v > s.written {
+@@ -764,6 +769,7 @@ fn audio_helper() {
+             mmap_burst: 192,
+             mmap_capacity: 3072,
+             mmap_below: 240,
++            dead_mmap: false,
+             media_index: 7,
+             media_sets: 0,
+             media_bad: 0,
+@@ -1145,6 +1151,89 @@ fn audio_helper() {
+     run.header(AU_STOP, true, 0, 0);
+     run.down();
+     std::env::remove_var("ONEIOS_AUDIO_TARGET_DECAY_S");
++
++    // 12. An MMAP exclusive stream whose server takes no frames (the S25's HAL: the DSP never started, no timestamp,
++    // every write times out with 0). The probe reopens the speaker as a mixer track before the guest's boot; the
++    // writer's watchdog (three timed-out writes, 600 ms) does the same in the middle of a run. After either, no open
++    // asks for MMAP again.
++    eprintln!("-- an MMAP stream whose server takes no frames: the mixer track instead");
++    k().hal = Hal::MmapExclusive;
++    k().dead_mmap = true;
++    let run = Run::up(&fake, "60");
++    let opens = k().out_opens;
++    run.header(AU_PROBE, true, 0, 0);
++    let mut answer = AuHeader::default();
++    let t0 = time::monotonic_s();
++    while time::monotonic_s() - t0 < 6.0 && answer.kind != AU_LATENCY {
++        let mut wait = libc::pollfd { fd: run.guest.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++        // SAFETY: one valid pollfd.
++        if unsafe { libc::poll(&mut wait, 1, 100) } > 0 {
++            let mut b = [0u8; AU_HEADER];
++            // SAFETY: a valid buffer of its length.
++            let got = unsafe { libc::recv(run.guest.as_raw_fd(), b.as_mut_ptr().cast(), b.len(), 0) };
++            answer = if got < AU_HEADER as isize { AuHeader::default() } else { AuHeader::read_from(&b) };
++        }
++    }
++    eprintln!("   probe: {} frames", answer.value);
++    // The mixer track starts on the guest's first period, so the probe's silence has no timestamp: not measured (0).
++    // What this case is about is the reopen.
++    assert!(answer.kind == AU_LATENCY && answer.value == 0);
++    assert_eq!(k().out_opens, opens + 2); // the MMAP stream, then the mixer track
++    assert!(!fake.last_out().mmap && k().mmap_policy_set == POLICY_NEVER);
++    assert_eq!(run.helper.ring().out_path, OutPath::Legacy);
++    run.header(AU_START, true, 2, 48000);
++    p.play(&run, 0.5, 0.0);
++    nap_s(0.1);
++    assert!(run.stats().played > 0); // the guest's sound plays on the mixer track
++    run.header(AU_STOP, true, 0, 0);
++    run.down();
++
++    // A stream that dies in the middle: a working MMAP stream, then its DSP stops taking frames while the guest's
++    // stream is up (no STOP: the guest's stream is kept). The writer notices in about 1 s, the receive loop reopens the
++    // speaker as a mixer track and the next period plays on it without a new START.
++    k().dead_mmap = false;
++    let run = Run::up(&fake, "60");
++    let opens = k().out_opens;
++    run.header(AU_START, true, 2, 48000);
++    p.play(&run, 0.3, 0.0);
++    assert!(fake.last_out().mmap && k().out_opens == opens + 1);
++    let played = run.stats().played;
++    assert!(played > 0);
++    k().dead_mmap = true;
++    let t0 = time::monotonic_s();
++    while time::monotonic_s() - t0 < 3.0 && k().out_opens < opens + 2 {
++        p.play(&run, 0.05, 0.0);
++    }
++    assert!(k().out_opens == opens + 2 && !fake.last_out().mmap);
++    assert_eq!(run.helper.ring().out_path, OutPath::Legacy);
++    assert!(run.helper.ring().playing()); // the guest's stream was not stopped: its periods still play
++    let played = run.stats().played; // the new stream's ring starts its counts again
++    p.play(&run, 0.5, 0.0);
++    nap_s(0.1);
++    assert!(run.stats().played > played);
++    run.header(AU_STOP, true, 0, 0);
++    run.down();
++    k().dead_mmap = false;
++
++    // A stream that is dead from its first write (no probe before it, as a later START after a new open): the write's
++    // 600 ms of timeouts reopen the speaker; the guest's first sound then plays on the mixer track.
++    let run = Run::up(&fake, "60");
++    let opens = k().out_opens;
++    k().dead_mmap = true;
++    run.header(AU_START, true, 2, 48000);
++    let t0 = time::monotonic_s();
++    while time::monotonic_s() - t0 < 3.0 && k().out_opens < opens + 2 {
++        p.play(&run, 0.05, 0.0);
++    }
++    assert!(k().out_opens == opens + 2 && !fake.last_out().mmap);
++    assert_eq!(run.helper.ring().out_path, OutPath::Legacy);
++    assert!(run.helper.ring().playing());
++    p.play(&run, 0.5, 0.0);
++    nap_s(0.1);
++    assert!(run.stats().played > 0);
++    run.header(AU_STOP, true, 0, 0);
++    run.down();
++    k().dead_mmap = false;
+     std::env::remove_var("ONEIOS_AUDIO_SYSTEM_SERVER");
+     std::env::remove_var("ONEIOS_AUDIO_LINGER_S");
+ }
+diff --git a/runtime/bridges/hw/host_device.rs b/runtime/bridges/hw/host_device.rs
+index e6242da..96ea32f 100644
+--- a/runtime/bridges/hw/host_device.rs
++++ b/runtime/bridges/hw/host_device.rs
+@@ -84,7 +84,7 @@ const NONE: &[&str] = &[];
+ //     here. Marks as in docs/s25.md: [F] read from the source named, [I] inferred, [U] unknown until a phone shows it.
+ // Match strings: the model prefixes and codenames are the phone gates' (scripts/port/verify-host.sh, docs/a56-oneos-fork.md);
+ // a SoC or platform match alone means "this SoC's entry" (the S24 and S24+ on SM8650 get the S24 Ultra's: no change).
+-static TABLE: [HostDevice; 5] = [
++static TABLE: [HostDevice; 6] = [
+     // The home device. [F] SM-S928*, e3q, SM8650 (verify-host.sh, the OneOS fork's gate); platform pineapple [F] (the
+     // stock device tree, qcom/pineapple-v2.dts, docs/hardware.md). No defaults: everything is today's.
+     // The model prefix takes every S24 Ultra model number (docs/hardware.md 7h, "The S24 Ultra's models"; the record
+@@ -146,6 +146,22 @@ static TABLE: [HostDevice; 5] = [
+         env: &["ONEIOS_THERMAL_SOC_TRIPS=1", "ONEIOS_THERMAL_SOC_SAMPLES=3"],
+         takeover: false,
+     },
++    HostDevice {
++        name: "galaxy-s25-plus",
++        label: "Galaxy S25+ (SM-S936, SM8750)",
++        models: &["SM-S936"],
++        devices: &["pa2q"],
++        socs: &["SM8750"],
++        platforms: &["sun"],
++        config: &["panel-fallback=1080x2340@120"],
++        env: &[
++            "ONEIOS_THERMAL_SOC_TRIPS=1",
++            "ONEIOS_THERMAL_SOC_SAMPLES=3",
++            "ONEIOS_THERMAL_SKIN=39,42,44,46,48",
++            "ONEIOS_THERMAL_BATTERY=43,47",
++        ],
++        takeover: false,
++    },
+     // docs/s26.md, profiles/host-galaxy-s26-ultra-sm8850.toml, the port-sm8850 commits. [F] SM-S948B, m3q, SM8850, platform
+     // canoe (YMGPwcca/OneiOS: the fork's SM-S948B, S948BXXS4BZIG, measured 2026-11-16; port-sm8850-s26, 2026-11-23).
+     // ONEIOS_BRIGHT_MAX=2300 [F]: the fork's phone with One UI in control, screen_brightness 255 (One UI's manual top)
+diff --git a/runtime/bridges/hw/test_hw_backend.rs b/runtime/bridges/hw/test_hw_backend.rs
+index e00cdc2..cce74c6 100644
+--- a/runtime/bridges/hw/test_hw_backend.rs
++++ b/runtime/bridges/hw/test_hw_backend.rs
+@@ -72,7 +72,10 @@ fn host_device() {
+     }
+     assert!(t[0].config.is_empty() && t[0].env.is_empty());
+     assert!(std::ptr::eq(host_find("GALAXY-A56").unwrap(), &t[4]) && host_find("pixel").is_none());
+-    assert_eq!(host_names(), "galaxy-s24-ultra, galaxy-s25-ultra, galaxy-s25, galaxy-s26-ultra, galaxy-a56");
++    assert_eq!(
++        host_names(),
++        "galaxy-s24-ultra, galaxy-s25-ultra, galaxy-s25, galaxy-s25-plus, galaxy-s26-ultra, galaxy-a56"
++    );
+ 
+     // Each known phone by its model (the phone gates' properties).
+     let p = phone(&tmp, "s24u", "SM-S928B", "e3q", "pineapple", "SM8650", "QTI");
+@@ -100,6 +103,7 @@ fn host_device() {
+     for (name, model, device, platform, soc, maker, want) in [
+         ("s25u", "SM-S938B", "pa3q", "sun", "SM8750", "QTI", "galaxy-s25-ultra"),
+         ("s25", "SM-S931B", "pa1q", "sun", "SM8750", "QTI", "galaxy-s25"),
++        ("s25plus", "SM-S936B", "pa2q", "sun", "SM8750", "QTI", "galaxy-s25-plus"),
+         ("s26u", "SM-S948B", "", "", "SM8850", "QTI", "galaxy-s26-ultra"),
+         ("a56", "SM-A566E", "a56x", "s5e8855", "s5e8855", "Samsung", "galaxy-a56"),
+     ] {
+diff --git a/runtime/xnuhost/src/config.rs b/runtime/xnuhost/src/config.rs
+index 097073d..fee91f3 100644
+--- a/runtime/xnuhost/src/config.rs
++++ b/runtime/xnuhost/src/config.rs
+@@ -1525,6 +1525,14 @@ impl Config {
+                 BOOT_ARGS_SIZE - 1
+             )));
+         }
++        if self.host.is_some_and(|host| host.0.name == "galaxy-s25-plus") {
++            if !has_switch(&self.boot_args, "hidq_size") && !has_switch(&self.boot_args, "oneios-hid-queue-kib") {
++                let _ = append_arg(&mut self.boot_args, BOOT_ARGS_SIZE, "oneios-hid-queue-kib=256");
++            }
++            if !has_switch(&self.boot_args, "oneios-hid-buttons-builtin") {
++                let _ = append_arg(&mut self.boot_args, BOOT_ARGS_SIZE, "oneios-hid-buttons-builtin=1");
++            }
++        }
+         if self.haptics_native_impacts == Some(true)
+             && native_impacts_boot_arg(&mut self.boot_args, BOOT_ARGS_SIZE).is_err()
+         {
+@@ -1585,6 +1593,12 @@ impl Config {
+         take!(self, image, "ram", ram_bytes);
+         take!(self, image, "ram-view", ram_view); // docs/booter.md 2.2 "The memory view"
+         take!(self, image, "ram-percent", ram_percent);
++        let s25plus_auto = self.host.is_some_and(|host| host.0.name == "galaxy-s25-plus")
++            && self.ram_bytes == 0
++            && (self.ram_percent == 45 || (!self.given("ram-percent") && !image.given("ram-percent")));
++        if s25plus_auto {
++            self.ram_percent = 56;
++        }
+         take!(self, image, "ram-host-floor", ram_host_floor);
+         take!(self, image, "host-mem-log", host_mem_log);
+         take!(self, image, "usb-log", usb_log);
+@@ -1711,7 +1725,11 @@ impl Config {
+                         self.ram_fit >> 20
+                     )));
+                 }
+-                self.ram_bytes = ram;
++                self.ram_bytes = if s25plus_auto && bound == Some(RamBound::Share) {
++                    s25plus_ram_with_headroom(ram, total.saturating_sub(self.ram_host_floor).min(self.ram_fit))
++                } else {
++                    ram
++                };
+                 self.ram_auto_bound = bound;
+                 self.ram_auto_total = total;
+                 self.ram_auto_available = available;
+@@ -1916,6 +1934,12 @@ sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-m
+ sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=1 droidvm-gpu-metal=1";
+ 
+ /// The keys a host table entry may give as device defaults.
++fn s25plus_ram_with_headroom(ram: u64, limit: u64) -> u64 {
++    let increment = 192 << 20;
++    let limit = limit.min(RAM_MAX);
++    [ram + 2 * increment, ram + increment].into_iter().find(|&size| size <= limit).unwrap_or(ram)
++}
++
+ fn device_key(key: &str) -> bool {
+     matches!(key, "gpu" | "panel-fallback" | "hz" | "width" | "height" | "scale" | "return-graceful-ms" | "astc")
+         || key.starts_with("hw-backend")
+diff --git a/runtime/xnuhost/src/config/tests.rs b/runtime/xnuhost/src/config/tests.rs
+index 8305334..2dbf3f6 100644
+--- a/runtime/xnuhost/src/config/tests.rs
++++ b/runtime/xnuhost/src/config/tests.rs
+@@ -1233,6 +1233,18 @@ fn host_device() {
+     let mut c = host_clear(c);
+     c.panel_fallback = None;
+     assert_eq!(c, off);
++    let props = host_props(&dir, "s25plus", "SM-S936B", "SM8750");
++    let c = rig.finish(Some(&props), None, None).unwrap();
++    assert_eq!(c.host, find("galaxy-s25-plus"));
++    assert_eq!(c.panel_fallback, Some(PanelMode { width: 1080, height: 2340, hz: 120 }));
++    assert!(has_switch(&c.boot_args, "oneios-hid-queue-kib"));
++    assert!(has_switch(&c.boot_args, "oneios-hid-buttons-builtin"));
++    assert!(!has_switch(&c.boot_args, "oneios-actuator"));
++    let c = rig
++        .finish(Some(&props), None, Some("boot-args-add=hidq_size=32768 oneios-hid-buttons-builtin=0"))
++        .unwrap();
++    assert!(!has_switch(&c.boot_args, "oneios-hid-queue-kib"));
++    assert!(c.boot_args.contains("oneios-hid-buttons-builtin=0"));
+     // The S26 Ultra: its brightness cap is an environment default (the session sets it); the config is today's.
+     let props = host_props(&dir, "s26u", "SM-S948B", "SM8850");
+     let c = rig.finish(Some(&props), None, None).unwrap();
+@@ -1343,6 +1355,14 @@ fn host_device() {
+     let _ = fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn s25plus_ram_increase_respects_headroom() {
++    let mib = 1 << 20;
++    assert_eq!(s25plus_ram_with_headroom(6144 * mib, 7000 * mib), 6528 * mib);
++    assert_eq!(s25plus_ram_with_headroom(6144 * mib, 6400 * mib), 6336 * mib);
++    assert_eq!(s25plus_ram_with_headroom(6144 * mib, 6200 * mib), 6144 * mib);
++}
++
+ // ---- session-mode= and --host-info (docs/booter.md 2.9d) ---------------------------------------------------------------
+ // hosted is the default and changes nothing; takeover only in the OneOS session, only on a phone whose host-table row
+ // allows it (the S24 Ultra, the S26 Ultra), and it turns the native touchscreen's grab on unless touch-exclusive= was
+diff --git a/runtime/xnuhost/src/session/bridges.rs b/runtime/xnuhost/src/session/bridges.rs
+index d9c7149..f9ee448 100644
+--- a/runtime/xnuhost/src/session/bridges.rs
++++ b/runtime/xnuhost/src/session/bridges.rs
+@@ -396,7 +396,10 @@ fn audio_latency_arg(config: &mut Config, audio: &dyn AudioBackend) {
+         logi!("audio: ONEIOS_AUDIO_PROBE=0: the kernel's default output latency");
+         return;
+     }
+-    let frames = match audio.probe_latency(2000) {
++    // 3 s: on a dead MMAP stream the helper gives up as soon as its writer has counted 600 ms of timeouts (about a
++    // second), and its fallback opens a mixer track without waiting on that track (the probe's 1.5 s are only spent on
++    // a stream that reads but gives no timestamp). The old 2 s left too little room for the fallback's open.
++    let frames = match audio.probe_latency(3000) {
+         Ok(f) if f > 0 => f,
+         Ok(_) => {
+             logi!(
+diff --git a/scripts/port/test-verify-host.sh b/scripts/port/test-verify-host.sh
+index 2e5abb2..019aee8 100755
+--- a/scripts/port/test-verify-host.sh
++++ b/scripts/port/test-verify-host.sh
+@@ -48,6 +48,7 @@ for m in SM-S928B SM-S928U1 SM-S928W SM-S928N SM-S9280; do
+ done
+ phone SM-S938B pa3q SM8750 sun kgsl;       expect 0 "profile ok (s25-ultra)" "the S25 Ultra passes"
+ phone SM-S931B pa1q SM8750 sun kgsl;       expect 0 "profile ok (s25)" "the base S25 passes"
++phone SM-S936B pa2q SM8750 sun kgsl;       expect 0 "profile ok (s25-plus)" "the S25+ passes"
+ phone SM-S948B m3q SM8850 canoe kgsl;      expect 0 "profile ok (s26-ultra)" "the S26 Ultra passes"
+ phone SM-S948B m1q SM8850 canoe kgsl;      expect 2 "device=m1q (expected m3q)" "an S26 Ultra model with another codename is refused"
+ phone SM-A566E a56x s5e8855 s5e8855 amdgpu; expect 0 "amdgpu render node: /dev/dri/renderD128" "the A56 passes, with its render node"
+diff --git a/scripts/port/verify-host.sh b/scripts/port/verify-host.sh
+index 14d4aa0..76cb341 100755
+--- a/scripts/port/verify-host.sh
++++ b/scripts/port/verify-host.sh
+@@ -5,6 +5,7 @@
+ #   SM-S928* e3q  SM8650   Galaxy S24 Ultra (home)                       Adreno 750, KGSL
+ #   SM-S938* pa3q SM8750   Galaxy S25 Ultra (docs/s25.md)                Adreno 830, KGSL
+ #   SM-S931* pa1q SM8750   Galaxy S25 (docs/s25.md)                      Adreno 830, KGSL
++#   SM-S936* pa2q SM8750   Galaxy S25+                                   Adreno 830, KGSL
+ #   SM-S948* m3q  SM8850   Galaxy S26 Ultra (docs/s26.md)            Adreno 840, KGSL
+ #   SM-A566* a56x s5e8855  Galaxy A56 (docs/a56.md)                      Xclipse 540, amdgpu (no 3D host backend here)
+ # Stand-in (host tests, scripts/port/test-verify-host.sh): VERIFY_HOST_GETPROP names the getprop to run,
+@@ -25,9 +26,10 @@ case "$MODEL" in
+   SM-S928*) HOST=s24-ultra WANT_DEVICE=e3q WANT_SOC=SM8650 ;;
+   SM-S938*) HOST=s25-ultra WANT_DEVICE=pa3q WANT_SOC=SM8750 ;;
+   SM-S931*) HOST=s25 WANT_DEVICE=pa1q WANT_SOC=SM8750 ;;
++  SM-S936*) HOST=s25-plus WANT_DEVICE=pa2q WANT_SOC=SM8750 ;;
+   SM-S948*) HOST=s26-ultra WANT_DEVICE=m3q WANT_SOC=SM8850 ;;
+   SM-A566*) HOST=a56 WANT_DEVICE=a56x WANT_SOC=s5e8855 ;;
+-  *) echo "verify-host: unsupported model (need SM-S928, SM-S938, SM-S931, SM-S948 or SM-A566)" >&2; exit 2 ;;
++  *) echo "verify-host: unsupported model (need SM-S928, SM-S938, SM-S936, SM-S931, SM-S948 or SM-A566)" >&2; exit 2 ;;
+ esac
+ [ "$SOC" = "$WANT_SOC" ] || { echo "verify-host: $MODEL but soc=$SOC (expected $WANT_SOC)" >&2; exit 2; }
+ [ "$DEVICE" = "$WANT_DEVICE" ] || { echo "verify-host: $WANT_SOC but device=$DEVICE (expected $WANT_DEVICE)" >&2; exit 2; }
+diff --git a/tools/oneios-tool/crates/oneios-phone/src/host.rs b/tools/oneios-tool/crates/oneios-phone/src/host.rs
+index e9b58e0..9756b7e 100644
+--- a/tools/oneios-tool/crates/oneios-phone/src/host.rs
++++ b/tools/oneios-tool/crates/oneios-phone/src/host.rs
+@@ -58,6 +58,22 @@ pub const TABLE: &[HostDevice] = &[
+         env: &["ONEIOS_THERMAL_SOC_TRIPS=1", "ONEIOS_THERMAL_SOC_SAMPLES=3"],
+         takeover: false,
+     },
++    HostDevice {
++        name: "galaxy-s25-plus",
++        label: "Galaxy S25+ (SM-S936, SM8750)",
++        models: &["SM-S936"],
++        devices: &["pa2q"],
++        socs: &["SM8750"],
++        platforms: &["sun"],
++        config: &["panel-fallback=1080x2340@120"],
++        env: &[
++            "ONEIOS_THERMAL_SOC_TRIPS=1",
++            "ONEIOS_THERMAL_SOC_SAMPLES=3",
++            "ONEIOS_THERMAL_SKIN=39,42,44,46,48",
++            "ONEIOS_THERMAL_BATTERY=43,47",
++        ],
++        takeover: false,
++    },
+     HostDevice {
+         name: "galaxy-s26-ultra",
+         label: "Galaxy S26 Ultra (SM-S948, SM8850)",
+@@ -224,6 +240,8 @@ mod tests {
+         }
+         assert_eq!(name(&facts("SM-S938B", "pa3q", "sun", "SM8750")), "galaxy-s25-ultra");
+         assert_eq!(name(&facts("SM-S931B", "pa1q", "sun", "SM8750")), "galaxy-s25");
++        assert_eq!(name(&facts("SM-S936B", "pa2q", "sun", "SM8750")), "galaxy-s25-plus");
++        assert_eq!(name(&facts("", "pa2q", "", "")), "galaxy-s25-plus");
+         assert_eq!(name(&facts("SM-S948B", "", "", "SM8850")), "galaxy-s26-ultra");
+         // The S26 Ultra by its codename and platform alone (port-sm8850-s26: m3q, canoe [F]), as a ROM that renames it.
+         assert_eq!(name(&facts("Galaxy S26 Ultra", "m3q", "", "")), "galaxy-s26-ultra");
