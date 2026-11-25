@@ -1,0 +1,128 @@
+diff --git a/runtime/xnuhost/src/config.c b/runtime/xnuhost/src/config.c
+index a112c6e..7b5f25d 100644
+--- a/runtime/xnuhost/src/config.c
++++ b/runtime/xnuhost/src/config.c
+@@ -480,9 +480,16 @@ int xh_config_finish(xh_config *c)
+       c->ram_bytes = xh_ram_fit_auto(total, (unsigned)c->ram_percent, (uint64_t)c->ram_host_floor, c->ram_fit_on ? c->ram_fit : UINT64_MAX,
+                                      &c->ram_auto_bound);
+       if (s25plus_auto_ram && c->ram_auto_bound == XH_RAM_BOUND_SHARE) {
+-        const uint64_t target = c->ram_bytes + (192ull << 20);  // about 200 MB, aligned to 2 MiB
+-        if (target <= XH_RAM_MAX && target <= total - (uint64_t)c->ram_host_floor && target <= c->ram_fit)
++        // Keep the previous 192 MiB increase when there's room for only one increment.
++        const uint64_t increment = 192ull << 20;  // about 200 MB, aligned to 2 MiB
++        uint64_t limit = total - (uint64_t)c->ram_host_floor;
++        if (c->ram_fit < limit) limit = c->ram_fit;
++        if (XH_RAM_MAX < limit) limit = XH_RAM_MAX;
++        const uint64_t target = c->ram_bytes + 2 * increment;
++        if (target <= limit)
+           c->ram_bytes = target;
++        else if (target - increment <= limit)
++          c->ram_bytes = target - increment;
+       }
+       if (!c->ram_bytes) {
+         fprintf(stderr, "xnuhost: ram=auto: this host has %llu MiB, %llu MiB of it available; %d%% of it, all but %llu MiB, or what fits "
+diff --git a/runtime/xnuhost/src/input.c b/runtime/xnuhost/src/input.c
+index 372ef4b..da63fac 100644
+--- a/runtime/xnuhost/src/input.c
++++ b/runtime/xnuhost/src/input.c
+@@ -42,6 +42,7 @@ static const uint16_t side_keys[3] = { KEY_VOLUMEDOWN_, KEY_VOLUMEUP_, KEY_POWER
+ static int64_t last_shown_ns;         // the guest's last frame (CLOCK_MONOTONIC), 0 = none yet
+ static int64_t down_ns;               // a touch-down on a still screen that waits for its frame, 0 = none
+ static int64_t down_frame_ns = -1;       // the wait of the last such touch-down, -1 = none measured
++uint64_t xh_input_touch_down_ms;
+ static int64_t monotonic_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec; }
+ 
+ // The screen counts as still when the guest showed no frame for this long before a touch-down.
+@@ -209,6 +210,8 @@ void xh_input_feed(xh_input_source *s, const xh_input_ev *ev, unsigned n, int64_
+         continue;
+       }
+       if (v->code != SYN_REPORT_ || !s->touch) continue;
++      if (s->began != s->frame_began && contacts(s) && now_ns > 0)
++        __atomic_store_n(&xh_input_touch_down_ms, (uint64_t)now_ns / 1000000, __ATOMIC_RELAXED);
+       if (s->touch) send_event(s, EV_MSC_, MSC_TIMESTAMP_, (int32_t)scan_ticks(v->time_ns, now_ns, now_counter, hz));
+       send_event(s, EV_SYN_, SYN_REPORT_, 0);
+       if (s->touch) count_frame(s, v->time_ns, now_ns);
+diff --git a/runtime/xnuhost/src/main.c b/runtime/xnuhost/src/main.c
+index 5ae5eb3..7abe5c0 100644
+--- a/runtime/xnuhost/src/main.c
++++ b/runtime/xnuhost/src/main.c
+@@ -30,6 +30,7 @@
+ #define EXIT_PANIC 4
+ 
+ static xh_config config;
++bool xh_cpu_interaction_governor;
+ static struct { uint32_t requested, reason, code; char why[96]; } stop_state;
+ static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+ static bool guest_ready;
+@@ -1134,9 +1135,10 @@ static void ram_choice_log(void)
+     return;
+   }
+   uint64_t total = config.ram_auto_total, floor = (uint64_t)config.ram_host_floor;
+-  if (config.s25plus && config.ram_bytes > xh_ram_auto(total, (unsigned)config.ram_percent, floor)) {
+-    LOGI("memory: ram=auto: the guest gets %llu MiB with the S25+ 192 MiB increase; %s",
+-         (unsigned long long)(config.ram_bytes >> 20), fits);
++  const uint64_t base = xh_ram_auto(total, (unsigned)config.ram_percent, floor);
++  if (config.s25plus && config.ram_bytes > base) {
++    LOGI("memory: ram=auto: the guest gets %llu MiB with the S25+ RAM increase of %llu MiB; %s",
++         (unsigned long long)(config.ram_bytes >> 20), (unsigned long long)((config.ram_bytes - base) >> 20), fits);
+     return;
+   }
+   static const char *const bound[] = { "?", "the share", "the floor", "what fits" };
+@@ -1282,6 +1284,7 @@ int main(int argc, char **argv)
+ #endif
+   xh_config_defaults(&config);
+   if (xh_config_args(&config, argc, argv) || xh_config_finish(&config)) return EXIT_SETUP;
++  xh_cpu_interaction_governor = config.s25plus;
+   xh_log_open(NULL, config.log_level);
+   LOGI("xnuhost: session ABI %d, mode %s, pid %d", config.session_abi, config.mode, getpid());
+   host_facts();
+diff --git a/runtime/xnuhost/src/task.c b/runtime/xnuhost/src/task.c
+index b94ae25..059b846 100644
+--- a/runtime/xnuhost/src/task.c
++++ b/runtime/xnuhost/src/task.c
+@@ -889,6 +889,14 @@ int64_t xh_thread_run(xh_vcpu *v, uint64_t handle, struct xh_user_state *state,
+       else if (XH_HINT_FLOOR(hint) > lo) lo = XH_HINT_FLOOR(hint) > 1024 ? 1024 : XH_HINT_FLOOR(hint);
+     }
+     const unsigned step = __atomic_load_n(&xh_cpu_thermal_step, __ATOMIC_RELAXED);
++    if (xh_cpu_interaction_governor && !step && lo > 512) {
++      const bool realtime = (hint & (XH_HINT_VALID | XH_HINT_REALTIME)) == (XH_HINT_VALID | XH_HINT_REALTIME);
++      const bool ui = (hint & (XH_HINT_VALID | XH_HINT_UI)) == (XH_HINT_VALID | XH_HINT_UI);
++      const uint64_t touch = __atomic_load_n(&xh_input_touch_down_ms, __ATOMIC_RELAXED);
++      // Leave room for short bursts such as a keyboard tap. After the burst, the host
++      // governor can still go above the floor when it sees real demand.
++      if (!realtime && (!ui || !touch || xh_mono_ms() - touch >= 240)) lo = 512;
++    }
+     if (step) {
+       // Apply thermal relief after the guest's hint so it cannot reinstate a high floor.
+       // Preserve foreground headroom and trim only background demand.
+diff --git a/runtime/xnuhost/src/xnuhost.h b/runtime/xnuhost/src/xnuhost.h
+index 5fdd00b..3b8d74a 100644
+--- a/runtime/xnuhost/src/xnuhost.h
++++ b/runtime/xnuhost/src/xnuhost.h
+@@ -526,6 +526,8 @@ extern void (*xh_cpu_place)(int tid, unsigned vcpu);
+ // so a clamp on it alone never reached iOS's own code (host-overhead, 2026-11-15).
+ extern unsigned (*xh_cpu_uclamp)(unsigned vcpu);
+ extern unsigned xh_cpu_thermal_step;  // S25+ session pressure, published by the thermal bridge
++extern bool xh_cpu_interaction_governor;
++extern uint64_t xh_input_touch_down_ms; // last new finger, on the host's monotonic clock
+ // drm2kgsl's vCPU clamp while a constrained queue animates (its patch 0008 calls drm2kgsl_vcpu_uclamp, cpu.c): 0 = none.
+ extern unsigned xh_gpu_vcpu_boost;
+ 
+diff --git a/runtime/xnuhost/tests/test_xnuhost.c b/runtime/xnuhost/tests/test_xnuhost.c
+index 834902e..04f38ee 100644
+--- a/runtime/xnuhost/tests/test_xnuhost.c
++++ b/runtime/xnuhost/tests/test_xnuhost.c
+@@ -1849,6 +1849,13 @@ static void test_config(const char *dir)
+   fclose(f);
+   xh_config_defaults(&c);
+   c.s25plus = true;
++  CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "ram-percent", "45") == 0 &&
++        xh_config_finish(&c) == 0 && c.ram_bytes == 6528 * M);
++  f = fopen(meminfo, "w");
++  fputs("MemTotal: 11379712 kB\nMemAvailable: 8192000 kB\n", f);
++  fclose(f);
++  xh_config_defaults(&c);
++  c.s25plus = true;
+   CHECK(xh_config_args(&c, 5, ram1) == 0 && xh_config_set(&c, "ram-percent", "45") == 0 &&
+         xh_config_finish(&c) == 0 && c.ram_bytes == 6336 * M);
+   f = fopen(meminfo, "w");

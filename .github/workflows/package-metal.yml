@@ -12,7 +12,7 @@ on:
         default: "44822977313"
         type: string
   push:
-    branches: [build/runtime-0.1.43]
+    branches: [build/runtime-0.1.45]
     paths:
       - .github/workflows/package-metal.yml
 permissions:
@@ -67,6 +67,10 @@ jobs:
           git apply ../port/patches/s25plus-earlier-cooling-ram-0.1.42.patch
           git apply --check ../port/patches/s25plus-manual-return-0.1.43.patch
           git apply ../port/patches/s25plus-manual-return-0.1.43.patch
+          git apply --check ../port/patches/s25plus-interactive-cooling-ram-0.1.44.patch
+          git apply ../port/patches/s25plus-interactive-cooling-ram-0.1.44.patch
+          git apply --check ../port/patches/s25plus-keyboard-feedback-0.1.45.patch
+          git apply ../port/patches/s25plus-keyboard-feedback-0.1.45.patch
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -121,13 +125,13 @@ jobs:
         env:
           ONEIOS_BUILD_AEA: '1'
           PACKAGE_EXTRA_DIR: ${{ github.workspace }}/metal-stage
-        run: bash runtime/package.sh 0.1.43-s25plusmetal
+        run: bash runtime/package.sh 0.1.45-s25plusmetal
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
-          name: OneiOS-S25Plus-Metal-Runtime-0.1.43
+          name: OneiOS-S25Plus-Metal-Runtime-0.1.45
           path: |
-            runtime-source/out/release/oneios-runtime-0.1.43-s25plusmetal-arm64.tar.zst
-            runtime-source/out/release/oneios-runtime-0.1.43-s25plusmetal-arm64.tar.zst.sha256
+            runtime-source/out/release/oneios-runtime-0.1.45-s25plusmetal-arm64.tar.zst
+            runtime-source/out/release/oneios-runtime-0.1.45-s25plusmetal-arm64.tar.zst.sha256
           if-no-files-found: error
           retention-days: 30
